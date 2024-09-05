@@ -1,2 +1,10 @@
-# hetde
-Research on distributed inference in heterogeneous edge devices.
+# Distributed Inference in Heterogenous Edge Devices
+
+## 개요 
+리소스가 제한된 환경에서 Large AI 모델의 추론을 하나의 기기가 수행하기에는 어려움이 있음.
+이에 대한 해결책 중 하나로 모델을 여러 부분으로 나누어 여러 기기가 분산해서 처리하는 분산 추론 방식이 제안되고 있음.
+사용자 요구사항과 기기들의 사양, 네트워크 상황에 맞게 적절하게 모델을 나누고 배포하는 방법이 필요함.
+
+## 연구 목표 
+기기간 연결을 최소화하는 모델 분할 기법 연구.
+Latency 를 줄이면서도 성능(accuracy)을 유지하는 것이 목표.
