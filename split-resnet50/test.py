@@ -71,17 +71,19 @@ class SplitConv2d(torch.nn.Module):
         # 즉, 쪼개진 conv들이 각각 계산한 출력 채널을 차곡차곡 포갠 것을 최종 출력으로 사용하는 것.
         return torch.cat([conv(x) for conv in self.partial_convs], dim=1)
 
-
+import tcp
 
 class WorkerNode:
     """
     실제로 연산을 진행할 장치와의 통신 로직을 감싸는 클래스
     """
-    def __init__(self, ip_addr):
-        pass
+    def __init__(self, host: str, port: int):
+        self.sock = tcp.connect_server(host, port)
 
-    def request_inference(x: torch.Tensor, original_layer_name: str, part_index: int):
-        pass
+    def request_inference(self, x: torch.Tensor, original_layer_name: str, part_index: int):
+        tcp.send_json(self.sock, {'original_layer_name' : original_layer_name, 'part_index' : part_index})
+        tcp.send_tensor(self.sock, x)
+        return tcp.recv_tensor(self.sock)
 
 
 class PartialConv2dProxy(torch.nn.Module):
@@ -122,6 +124,7 @@ class DistributedConv2d(torch.nn.Module):
         return torch.cat([conv(x) for conv in self.partial_convs], dim=1)
 
 
+
 # ResNet 모델의 모든 Conv2d 멤버 변수를 SplitConv2d로 교체하기 위한 recursive setattr()
 # 출처: https://stackoverflow.com/questions/31174295/getattr-and-setattr-on-nested-subobjects-chained-properties
 import functools
@@ -144,21 +147,36 @@ class SplitResnet(torch.nn.Module):
     def __init__(self, model: models.ResNet):
         super(SplitResnet, self).__init__()
         self.model = copy.deepcopy(model)
-        self.partial_conv_dict = {}
+        self.split_conv_dict = {}
 
         for name, layer in self.model.named_modules():
             if isinstance(layer, torch.nn.Conv2d):
                 # TODO: 정확히 반반 말고 임의의 수와 비율로 쪼갤 수 있게 만들기
-                self.partial_conv_dict[name] = SplitConv2d(layer, out_channels_per_part = [layer.out_channels // 2, layer.out_channels // 2])
+                self.split_conv_dict[name] = SplitConv2d(layer, out_channels_per_part = [layer.out_channels // 2, layer.out_channels // 2])
 
-        for name, layer in self.partial_conv_dict.items():
+        for name, layer in self.split_conv_dict.items():
             rsetattr(self.model, name, layer)
 
     def forward(self, x: torch.Tensor):
         return self.model(x)
-        
+
+
+    
+class DistributedResnet(torch.nn.Module):
+    def __init__(self, split_model: SplitResnet, worker_nodes: list[WorkerNode]):
+        super(DistributedResnet, self).__init__()
+        self.split_model = split_model
+
+        for name, layer in self.split_model.split_conv_dict.items():
+            rsetattr(self.split_model.model, name, DistributedConv2d(name, worker_nodes))
+
+    def forward(self, x: torch.Tensor):
+        return self.split_model(x)
+
 
 from tqdm import tqdm
+from multiprocessing import Process
+import time
 
 def assert_model_equality(model1: torch.nn.Module, model2: torch.nn.Module, input_shape: torch.Size, num_tests: int = 100):
     model1.eval()
@@ -189,12 +207,59 @@ def assert_split_resnet_correctness():
     split = SplitResnet(orig)
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
+def test_worker_node_server(port: int):
+    with tcp.create_server('localhost', port) as server:
+        client_sock, client_addr = server.accept()
 
-def print_all_named_modules(model: torch.nn.Module):
-    for name, layer in model.named_modules():
-        print(name, layer._get_name())
+        orig = models.resnet50()
+        split = SplitResnet(orig)
+
+        while True:
+            header = tcp.recv_json(client_sock)
+            if 'terminate' in header:
+                break
+
+            x = tcp.recv_tensor(client_sock)
+            with torch.no_grad():
+                y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
+                tcp.send_tensor(client_sock, y)
+
+        client_sock.close()
+
+def assert_distributed_resnet_correctness():
+    tcp.supress_immutable_tensor_warning()
+
+    progress = tqdm(total = 1, desc = 'initializing worker nodes')
+    worker1 = Process(target = test_worker_node_server, args = (1111,))
+    worker2 = Process(target = test_worker_node_server, args = (2222,))
+    worker1.start()
+    worker2.start()
+
+    time.sleep(1)
+
+    progress.update()
+    progress.close()
+
+    orig = models.resnet50()
+    split = SplitResnet(orig)
+
+    worker_nodes = [
+        WorkerNode('localhost', 1111),
+        WorkerNode('localhost', 2222),
+    ]
+    distributed = DistributedResnet(split, worker_nodes)
+
+    assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
+
+    tcp.send_json(worker_nodes[0].sock, {'terminate' : True})
+    tcp.send_json(worker_nodes[1].sock, {'terminate' : True})
+
+    worker1.join()
+    worker2.join()
 
 
 if __name__ == '__main__':
-    assert_split_conv_correctness()
+    tcp.assert_tcp_communication()
+    assert_distributed_resnet_correctness()
     assert_split_resnet_correctness()
+    assert_split_conv_correctness()
