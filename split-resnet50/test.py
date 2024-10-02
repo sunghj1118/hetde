@@ -83,6 +83,8 @@ class WorkerNode:
     def request_inference(self, x: torch.Tensor, original_layer_name: str, part_index: int):
         tcp.send_json(self.sock, {'original_layer_name' : original_layer_name, 'part_index' : part_index})
         tcp.send_tensor(self.sock, x)
+
+    def receive_inference_result(self):
         return tcp.recv_json(self.sock), tcp.recv_tensor(self.sock)
 
 
@@ -110,12 +112,20 @@ class PartialConv2dProxy(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         start = time.time()
-        header, result = self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+        header, result = self.worker_node.receive_inference_result()
         end = time.time()
         total_time = end - start
         network_overhead = total_time - header['time']
         print('PartialConv2dProxy [{}]: {:.7f} (network overhead: {:.2f}%)'.format(self.original_layer_name, total_time, network_overhead / total_time * 100))
         return result
+    
+    def request_inference(self, x: torch.Tensor):
+        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+
+    def receive_inference_result(self):
+        return self.worker_node.receive_inference_result()
+
 
 
 class DistributedConv2d(torch.nn.Module):
@@ -128,10 +138,33 @@ class DistributedConv2d(torch.nn.Module):
     
     def forward(self, x: torch.Tensor):
         start = time.time()
-        partial_outputs = [conv(x) for conv in self.partial_convs]
+
+        # 연결된 워커 노드에 부분적인 inference를 요청
+        sequential = False
+        if sequential:
+            # case 1) 순차적 요청: 1번 워커의 응답이 온 뒤에 2번 워커에 요청을 보냄
+            partial_outputs = [conv(x) for conv in self.partial_convs]
+        else:
+            # case 2) 병렬적 요청: 요청을 일단 전부 보내놓고 응답은 모든 요청이 전송된 뒤에 순차적으로 수신
+            for conv in self.partial_convs:
+                conv.request_inference(x)
+
+            partial_outputs = []
+            times = []
+            for conv in self.partial_convs:
+                header, result = conv.receive_inference_result()
+                partial_outputs.append(result)
+                times.append(header['time'])
+        
         middle = time.time()
+
+        # 부분적인 inference 결과를 포개서 최종 출력 재현
         net_output = torch.cat(partial_outputs, dim=1)
+
         end = time.time()
+        if not sequential:
+            for t in times:
+                print('PartialConv2dProxy: {:.7f}'.format(t))
         print('DistributedConv2D [{}]: {:.7f} (partial convs: {:.2f}%, concat: {:.2f}%)'.format(self.partial_convs[0].original_layer_name, end - start, (middle - start) / (end - start) * 100, (end - middle) / (end - start) * 100))
         return net_output
 
@@ -236,6 +269,10 @@ def test_worker_node_server(port: int):
                 start = time.time()
                 y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
                 end = time.time()
+
+                # 네트워크 딜레이 재현
+                # time.sleep(0.02)
+                
                 tcp.send_json(client_sock, {'time' : end - start})
                 tcp.send_tensor(client_sock, y)
 
