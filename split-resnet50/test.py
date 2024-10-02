@@ -83,7 +83,7 @@ class WorkerNode:
     def request_inference(self, x: torch.Tensor, original_layer_name: str, part_index: int):
         tcp.send_json(self.sock, {'original_layer_name' : original_layer_name, 'part_index' : part_index})
         tcp.send_tensor(self.sock, x)
-        return tcp.recv_tensor(self.sock)
+        return tcp.recv_json(self.sock), tcp.recv_tensor(self.sock)
 
 
 class PartialConv2dProxy(torch.nn.Module):
@@ -109,7 +109,13 @@ class PartialConv2dProxy(torch.nn.Module):
         self.worker_node = worker_node
 
     def forward(self, x: torch.Tensor):
-        return self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+        start = time.time()
+        header, result = self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+        end = time.time()
+        total_time = end - start
+        network_overhead = total_time - header['time']
+        print('PartialConv2dProxy [{}]: {:.7f} (network overhead: {:.2f}%)'.format(self.original_layer_name, total_time, network_overhead / total_time * 100))
+        return result
 
 
 class DistributedConv2d(torch.nn.Module):
@@ -121,7 +127,13 @@ class DistributedConv2d(torch.nn.Module):
             self.partial_convs.append(PartialConv2dProxy(original_layer_name, part_index, worker_node))
     
     def forward(self, x: torch.Tensor):
-        return torch.cat([conv(x) for conv in self.partial_convs], dim=1)
+        start = time.time()
+        partial_outputs = [conv(x) for conv in self.partial_convs]
+        middle = time.time()
+        net_output = torch.cat(partial_outputs, dim=1)
+        end = time.time()
+        print('DistributedConv2D [{}]: {:.7f} (partial convs: {:.2f}%, concat: {:.2f}%)'.format(self.partial_convs[0].original_layer_name, end - start, (middle - start) / (end - start) * 100, (end - middle) / (end - start) * 100))
+        return net_output
 
 
 
@@ -221,7 +233,10 @@ def test_worker_node_server(port: int):
 
             x = tcp.recv_tensor(client_sock)
             with torch.no_grad():
+                start = time.time()
                 y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
+                end = time.time()
+                tcp.send_json(client_sock, {'time' : end - start})
                 tcp.send_tensor(client_sock, y)
 
         client_sock.close()
