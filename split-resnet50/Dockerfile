@@ -3,6 +3,7 @@ FROM pytorch/pytorch
 RUN pip install Flask
 
 COPY test.py test.py
+COPY runtime.py runtime.py
 COPY tcp.py tcp.py
 
 CMD ["python", "test.py"]

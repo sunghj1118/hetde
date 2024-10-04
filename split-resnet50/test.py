@@ -1,7 +1,7 @@
 import copy
 import torch
 import torchvision.models as models
-
+from runtime import RuntimeRecord
 
 class PartialConv2d(torch.nn.Module):
     def __init__(self, conv: torch.nn.Conv2d, out_channel_begin: int, out_channel_end: int):
@@ -93,11 +93,11 @@ class PartialConv2dProxy(torch.nn.Module):
     """
     WorkerNode를 통해 연산을 처리하는 PartialConv2d의 프록시
     """
-    def __init__(self, original_layer_name: str, part_index: int, worker_node: WorkerNode, runtime_dict: dict):
+    def __init__(self, original_layer_name: str, part_index: int, worker_node: WorkerNode, runtime_record: RuntimeRecord):
         """
         :param original_layer_name: 쪼개지기 전 원본 conv 레이어가 모델 전체 시점에서 갖는 이름.
         :param part_index: 쪼개진 부분 중에서 몇 번째 출력 채널 범위를 계산할 것인지.
-        :param runtime_dict: 해당 레이어의 실행 시간 세부 사항을 기록할 dictionary.
+        :param runtime_record: 해당 레이어의 실행 시간 세부 사항을 기록할 구조체.
 
         .. example::
         split = SplitConv2d(model.conv1, [2, 4, 10])가 있다고 하면  
@@ -111,7 +111,9 @@ class PartialConv2dProxy(torch.nn.Module):
         self.original_layer_name = original_layer_name
         self.part_index = part_index
         self.worker_node = worker_node
-        self.runtime_dict = runtime_dict
+        self.runtime_record = runtime_record
+        self.local_computation = runtime_record.create_subcategory('local computation')
+        self.network_overhead = runtime_record.create_subcategory('network overhead')
 
     def forward(self, x: torch.Tensor):
         """
@@ -156,9 +158,9 @@ class PartialConv2dProxy(torch.nn.Module):
         :param total_runtime: 요청 시작부터 응답을 받은 시점까지의 시간
         :param local_computation_runtime: worker node에서 요청을 받은 뒤부터 응답을 전송하기 직전까지 걸린 순수 연산 시간
         """
-        self.runtime_dict['total'] = total_runtime
-        self.runtime_dict['local computation'] = {'total' : local_computation_runtime}
-        self.runtime_dict['network overhead'] = {'total' : total_runtime - local_computation_runtime}
+        self.runtime_record.total_runtime = total_runtime
+        self.local_computation.total_runtime = local_computation_runtime
+        self.network_overhead.total_runtime = total_runtime - local_computation_runtime
 
 
 
@@ -168,16 +170,16 @@ class DistributedConv2d(torch.nn.Module):
     PartialConv2d를 직접 계산하는 대신 대응되는 worker node에
     요청을 보내는 PartialConv2dProxy를 사용한다.
     """
-    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], runtime_dict: dict):
+    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], runtime_record: RuntimeRecord):
         super(DistributedConv2d, self).__init__()
 
         self.partial_convs = torch.nn.ModuleList()
-        self.runtime_dict = runtime_dict
-        self.runtime_dict['partial convs'] = {}
+        self.runtime_record = runtime_record
+        self.partial_convs_runtime = runtime_record.create_subcategory('partial convs')
+        self.concat_runtime = runtime_record.create_subcategory('concat')
         for part_index, worker_node in enumerate(worker_nodes):
-            worker_runtime_dict = {}
-            self.runtime_dict['partial convs']['worker {}'.format(part_index)] = worker_runtime_dict
-            self.partial_convs.append(PartialConv2dProxy(original_layer_name, part_index, worker_node, worker_runtime_dict))
+            worker_runtime = self.partial_convs_runtime.create_subcategory('worker {}'.format(part_index))
+            self.partial_convs.append(PartialConv2dProxy(original_layer_name, part_index, worker_node, worker_runtime))
     
     def forward(self, x: torch.Tensor):
         start = time.time()
@@ -202,9 +204,9 @@ class DistributedConv2d(torch.nn.Module):
         end = time.time()
 
         # 실행 시간 기록
-        self.runtime_dict['total'] = end - start
-        self.runtime_dict['partial convs']['total'] = middle - start
-        self.runtime_dict['concat'] = {'total' : end - middle}
+        self.runtime_record.total_runtime = end - start
+        self.partial_convs_runtime.total_runtime = middle - start
+        self.concat_runtime.total_runtime = end - middle
         
         return net_output
 
@@ -250,29 +252,17 @@ class DistributedResnet(torch.nn.Module):
     def __init__(self, split_model: SplitResnet, worker_nodes: list[WorkerNode]):
         super(DistributedResnet, self).__init__()
         self.split_model = split_model
-        self.runtime_dict = {}
+        self.runtime_record = RuntimeRecord('DistributedResnet')
 
         for name, layer in self.split_model.split_conv_dict.items():
-            self.runtime_dict[name] = {}
-            rsetattr(self.split_model.model, name, DistributedConv2d(name, worker_nodes, self.runtime_dict[name]))
+            rsetattr(self.split_model.model, name, DistributedConv2d(name, worker_nodes, self.runtime_record.create_subcategory(name)))
 
     def forward(self, x: torch.Tensor):
         start = time.time()
         result = self.split_model(x)
         end = time.time()
-        self.runtime_dict['total'] = end - start
+        self.runtime_record.total_runtime = end - start
         return result
-    
-    def print_runtime_stats(self):
-        print('DistributedResnet: 100% ({:.7f})'.format(self.runtime_dict['total']))
-        print_recursive_runtime_dict(self.runtime_dict)
-
-
-def print_recursive_runtime_dict(runtime_dict: dict, indent_level: int = 0):
-    for subcategory, subcategory_runtime_dict in runtime_dict.items():
-        if subcategory != 'total':
-            print('{}- {}: {:.2f}% ({:.7f})'.format(' '* indent_level * 4, subcategory, subcategory_runtime_dict['total'] / runtime_dict['total'] * 100, subcategory_runtime_dict['total']))
-            print_recursive_runtime_dict(subcategory_runtime_dict, indent_level + 1)
 
 
 from tqdm import tqdm
@@ -359,7 +349,10 @@ def assert_distributed_resnet_correctness():
 
     assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
 
-    distributed.print_runtime_stats()
+    distributed.runtime_record.print_runtime()
+    print('net local computation:', distributed.runtime_record.net_runtime_per_category('local computation'))
+    print('net network overhead:', distributed.runtime_record.net_runtime_per_category('network overhead'))
+    print('net concat:', distributed.runtime_record.net_runtime_per_category('concat'))
 
     tcp.send_json(worker_nodes[0].sock, {'terminate' : True})
     tcp.send_json(worker_nodes[1].sock, {'terminate' : True})
