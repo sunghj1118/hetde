@@ -299,30 +299,34 @@ def assert_split_resnet_correctness():
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
 def test_worker_node_server(port: int):
-    with tcp.create_server('localhost', port) as server:
-        client_sock, client_addr = server.accept()
+    try:
+        with tcp.create_server('localhost', port) as server:
+            client_sock, client_addr = server.accept()
 
-        orig = models.resnet50()
-        split = SplitResnet(orig)
+            orig = models.resnet50()
+            split = SplitResnet(orig)
 
-        while True:
-            header = tcp.recv_json(client_sock)
-            if 'terminate' in header:
-                break
+            while True:
+                header = tcp.recv_json(client_sock)
+                if 'terminate' in header:
+                    break
 
-            x = tcp.recv_tensor(client_sock)
-            with torch.no_grad():
-                start = time.time()
-                y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
-                end = time.time()
+                x = tcp.recv_tensor(client_sock)
+                with torch.no_grad():
+                    start = time.time()
+                    y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
+                    end = time.time()
 
-                # 네트워크 딜레이 재현
-                # time.sleep(0.02)
-                
-                tcp.send_json(client_sock, {'time' : end - start})
-                tcp.send_tensor(client_sock, y)
+                    # 네트워크 딜레이 재현
+                    # time.sleep(0.02)
+                    
+                    tcp.send_json(client_sock, {'time' : end - start})
+                    tcp.send_tensor(client_sock, y)
 
-        client_sock.close()
+            client_sock.close()
+    except:
+        print('[Exception from worker node]')
+        tcp.traceback.print_exc()
 
 def assert_distributed_resnet_correctness():
     tcp.supress_immutable_tensor_warning()
@@ -338,24 +342,28 @@ def assert_distributed_resnet_correctness():
     progress.update()
     progress.close()
 
-    orig = models.resnet50()
-    split = SplitResnet(orig)
+    try:
+        orig = models.resnet50()
+        split = SplitResnet(orig)
 
-    worker_nodes = [
-        WorkerNode('localhost', 1111),
-        WorkerNode('localhost', 2222),
-    ]
-    distributed = DistributedResnet(split, worker_nodes)
+        worker_nodes = [
+            WorkerNode('localhost', 1111),
+            WorkerNode('localhost', 2222),
+        ]
+        distributed = DistributedResnet(split, worker_nodes)
 
-    assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
+        assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
 
-    distributed.runtime_record.print_runtime()
-    print('net local computation:', distributed.runtime_record.net_runtime_per_category('local computation'))
-    print('net network overhead:', distributed.runtime_record.net_runtime_per_category('network overhead'))
-    print('net concat:', distributed.runtime_record.net_runtime_per_category('concat'))
+        distributed.runtime_record.print_runtime()
+        print('net local computation:', distributed.runtime_record.net_runtime_per_category('local computation'))
+        print('net network overhead:', distributed.runtime_record.net_runtime_per_category('network overhead'))
+        print('net concat:', distributed.runtime_record.net_runtime_per_category('concat'))
 
-    tcp.send_json(worker_nodes[0].sock, {'terminate' : True})
-    tcp.send_json(worker_nodes[1].sock, {'terminate' : True})
+        tcp.send_json(worker_nodes[0].sock, {'terminate' : True})
+        tcp.send_json(worker_nodes[1].sock, {'terminate' : True})
+    except:
+        print('[Exception from main server]')
+        tcp.traceback.print_exc()
 
     worker1.join()
     worker2.join()

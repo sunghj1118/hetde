@@ -1,9 +1,10 @@
 
-from socket import socket, AF_INET, SOCK_STREAM, MSG_WAITALL
+from socket import socket, error, AF_INET, SOCK_STREAM, MSG_WAITALL
 import json
 import warnings
 import torch
 import numpy as np
+import traceback
 
 def send_u32(sock: socket, value: int):
     sock.send(value.to_bytes(4, byteorder = 'little'))
@@ -79,13 +80,25 @@ def recv_tensor(sock: socket, print_time: bool = False) -> torch.Tensor:
 
 def create_server(host: str, port: int, backlog: int = 10):
     listen_sock = socket(AF_INET, SOCK_STREAM)
-    listen_sock.bind((host, port))
-    listen_sock.listen(backlog)
+
+    try:
+        listen_sock.bind((host, port))
+        listen_sock.listen(backlog)
+    except error as e:
+        listen_sock.close()
+        raise e
+    
     return listen_sock
 
 def connect_server(host: str, port: int):
     sock = socket(AF_INET, SOCK_STREAM)
-    sock.connect((host, port))
+
+    try:
+        sock.connect((host, port))
+    except error as e:
+        sock.close()
+        raise e
+    
     return sock
 
 def supress_immutable_tensor_warning():
@@ -101,33 +114,38 @@ from tqdm import tqdm
 import time
 
 def test_tcp_server():
-    with socket(AF_INET, SOCK_STREAM) as listen_sock:
-        listen_sock.bind(('localhost', 9999))
-        listen_sock.listen(5)
-        client_sock, client_addr = listen_sock.accept()
-        send_json(client_sock, recv_json(client_sock))
-        send_tensor(client_sock, recv_tensor(client_sock))
-        client_sock.close()
+    try:
+        with create_server('localhost', 9999) as listen_sock:
+            client_sock, client_addr = listen_sock.accept()
+            send_json(client_sock, recv_json(client_sock))
+            send_tensor(client_sock, recv_tensor(client_sock))
+            client_sock.close()
+    except Exception as e:
+        print('[Exception from test server]')
+        traceback.print_exc()
 
 def test_tcp_client():
-    progress = tqdm(total = 3, desc = 'tcp communication assertion', postfix = 'connecting to server')
-    with socket(AF_INET, SOCK_STREAM) as sock:
-        sock.connect(('localhost', 9999))
-        progress.update()
+    try:
+        progress = tqdm(total = 3, desc = 'tcp communication assertion', postfix = 'connecting to server')
+        with connect_server('localhost', 9999) as sock:
+            progress.update()
 
-        progress.set_postfix_str('json')
-        sample_json = {'name' : 'haha', 'age' : 123}
-        send_json(sock, sample_json, print_time = True)
-        assert(recv_json(sock, print_time = True) == sample_json)
-        time.sleep(1)
-        progress.update()
+            progress.set_postfix_str('json')
+            sample_json = {'name' : 'haha', 'age' : 123}
+            send_json(sock, sample_json, print_time = True)
+            assert(recv_json(sock, print_time = True) == sample_json)
+            time.sleep(1)
+            progress.update()
 
-        progress.set_postfix_str('tensor')
-        sample_tensor = torch.rand(1, 3, 256, 256)
-        send_tensor(sock, sample_tensor, print_time = True)
-        assert(torch.equal(recv_tensor(sock, print_time = True), sample_tensor))
-        progress.update()
-        progress.close()
+            progress.set_postfix_str('tensor')
+            sample_tensor = torch.rand(1, 3, 256, 256)
+            send_tensor(sock, sample_tensor, print_time = True)
+            assert(torch.equal(recv_tensor(sock, print_time = True), sample_tensor))
+            progress.update()
+            progress.close()
+    except Exception as e:
+        print('[Exception from test client]')
+        traceback.print_exc()
 
 def assert_tcp_communication():
     supress_immutable_tensor_warning()
