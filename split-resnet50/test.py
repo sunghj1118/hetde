@@ -1,7 +1,7 @@
 import copy
 import torch
 import torchvision.models as models
-
+from runtime import RuntimeRecord
 
 class PartialConv2d(torch.nn.Module):
     def __init__(self, conv: torch.nn.Conv2d, out_channel_begin: int, out_channel_end: int):
@@ -75,7 +75,8 @@ import tcp
 
 class WorkerNode:
     """
-    실제로 연산을 진행할 장치와의 통신 로직을 감싸는 클래스
+    실제로 연산을 진행할 장치와의 통신 로직을 감싸는 클래스.
+    마스터 서버에서 이 객체를 통해 입력 데이터를 전달하고 추론 결과를 수신한다.
     """
     def __init__(self, host: str, port: int):
         self.sock = tcp.connect_server(host, port)
@@ -83,17 +84,20 @@ class WorkerNode:
     def request_inference(self, x: torch.Tensor, original_layer_name: str, part_index: int):
         tcp.send_json(self.sock, {'original_layer_name' : original_layer_name, 'part_index' : part_index})
         tcp.send_tensor(self.sock, x)
-        return tcp.recv_tensor(self.sock)
+
+    def receive_inference_result(self):
+        return tcp.recv_json(self.sock), tcp.recv_tensor(self.sock)
 
 
 class PartialConv2dProxy(torch.nn.Module):
     """
     WorkerNode를 통해 연산을 처리하는 PartialConv2d의 프록시
     """
-    def __init__(self, original_layer_name: str, part_index: int, worker_node: WorkerNode):
+    def __init__(self, original_layer_name: str, part_index: int, worker_node: WorkerNode, runtime_record: RuntimeRecord):
         """
         :param original_layer_name: 쪼개지기 전 원본 conv 레이어가 모델 전체 시점에서 갖는 이름.
         :param part_index: 쪼개진 부분 중에서 몇 번째 출력 채널 범위를 계산할 것인지.
+        :param runtime_record: 해당 레이어의 실행 시간 세부 사항을 기록할 구조체.
 
         .. example::
         split = SplitConv2d(model.conv1, [2, 4, 10])가 있다고 하면  
@@ -107,21 +111,104 @@ class PartialConv2dProxy(torch.nn.Module):
         self.original_layer_name = original_layer_name
         self.part_index = part_index
         self.worker_node = worker_node
+        self.runtime_record = runtime_record
+        self.local_computation = runtime_record.create_subcategory('local computation')
+        self.network_overhead = runtime_record.create_subcategory('network overhead')
 
     def forward(self, x: torch.Tensor):
-        return self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+        """
+        worker node에 요청을 보내고 응답을 기다리는 blocking 방식의 함수.
+        이 함수를 사용해 inference를 진행하면 병렬 처리가 불가능하니
+        여러 worker를 사용하는 경우 request_inference()를 사용하는 것을 권장함.
+        """
+        start = time.time()
+
+        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+        header, result = self.worker_node.receive_inference_result()
+
+        end = time.time()
+        self.record_runtime(total_runtime = end - start, local_computation_runtime = header['time'])
+        return result
+    
+    def request_inference(self, x: torch.Tensor):
+        """
+        forward()는 worker node에서 응답이 올 때까지 실행이 멈추는 blocking operation이라서
+        병렬로 모든 worker에 요청만 보내는 함수가 필요함.
+        여기서 요청을 보내면 receive_inference_result() 함수로 응답을 기다릴 수 있다.
+        """
+        self.request_start_time = time.time()
+        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+
+    def receive_inference_result(self):
+        """
+        request_inference()와 한 쌍으로 사용되는 함수.
+        조금 전에 보낸 요청에 대한 응답을 받고 실행 시간을 기록한다.
+        """
+        header, result = self.worker_node.receive_inference_result()
+
+        request_end_time = time.time()
+        self.record_runtime(total_runtime = request_end_time - self.request_start_time, local_computation_runtime = header['time'])
+
+        return result
+
+    def record_runtime(self, total_runtime: float, local_computation_runtime: float):
+        """
+        이번 inference에 소요된 시간을 기록한다.
+
+        :param total_runtime: 요청 시작부터 응답을 받은 시점까지의 시간
+        :param local_computation_runtime: worker node에서 요청을 받은 뒤부터 응답을 전송하기 직전까지 걸린 순수 연산 시간
+        """
+        self.runtime_record.total_runtime = total_runtime
+        self.local_computation.total_runtime = local_computation_runtime
+        self.network_overhead.total_runtime = total_runtime - local_computation_runtime
+
 
 
 class DistributedConv2d(torch.nn.Module):
-    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode]):
+    """
+    SplitConv2d의 분산 처리 버전.
+    PartialConv2d를 직접 계산하는 대신 대응되는 worker node에
+    요청을 보내는 PartialConv2dProxy를 사용한다.
+    """
+    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], runtime_record: RuntimeRecord):
         super(DistributedConv2d, self).__init__()
 
         self.partial_convs = torch.nn.ModuleList()
+        self.runtime_record = runtime_record
+        self.partial_convs_runtime = runtime_record.create_subcategory('partial convs')
+        self.concat_runtime = runtime_record.create_subcategory('concat')
         for part_index, worker_node in enumerate(worker_nodes):
-            self.partial_convs.append(PartialConv2dProxy(original_layer_name, part_index, worker_node))
+            worker_runtime = self.partial_convs_runtime.create_subcategory('worker {}'.format(part_index))
+            self.partial_convs.append(PartialConv2dProxy(original_layer_name, part_index, worker_node, worker_runtime))
     
     def forward(self, x: torch.Tensor):
-        return torch.cat([conv(x) for conv in self.partial_convs], dim=1)
+        start = time.time()
+
+        # 연결된 워커 노드에 부분적인 inference를 요청
+        sequential = False
+        if sequential:
+            # case 1) 순차적 요청: 1번 워커의 응답이 온 뒤에 2번 워커에 요청을 보냄
+            partial_outputs = [conv(x) for conv in self.partial_convs]
+        else:
+            # case 2) 병렬적 요청: 요청을 일단 전부 보내놓고 응답은 모든 요청이 전송된 뒤에 순차적으로 수신
+            for conv in self.partial_convs:
+                conv.request_inference(x)
+
+            partial_outputs = [conv.receive_inference_result() for conv in self.partial_convs]
+        
+        middle = time.time()
+
+        # 부분적인 inference 결과를 포개서 최종 출력 재현
+        net_output = torch.cat(partial_outputs, dim=1)
+
+        end = time.time()
+
+        # 실행 시간 기록
+        self.runtime_record.total_runtime = end - start
+        self.partial_convs_runtime.total_runtime = middle - start
+        self.concat_runtime.total_runtime = end - middle
+        
+        return net_output
 
 
 
@@ -161,17 +248,21 @@ class SplitResnet(torch.nn.Module):
         return self.model(x)
 
 
-    
 class DistributedResnet(torch.nn.Module):
     def __init__(self, split_model: SplitResnet, worker_nodes: list[WorkerNode]):
         super(DistributedResnet, self).__init__()
         self.split_model = split_model
+        self.runtime_record = RuntimeRecord('DistributedResnet')
 
         for name, layer in self.split_model.split_conv_dict.items():
-            rsetattr(self.split_model.model, name, DistributedConv2d(name, worker_nodes))
+            rsetattr(self.split_model.model, name, DistributedConv2d(name, worker_nodes, self.runtime_record.create_subcategory(name)))
 
     def forward(self, x: torch.Tensor):
-        return self.split_model(x)
+        start = time.time()
+        result = self.split_model(x)
+        end = time.time()
+        self.runtime_record.total_runtime = end - start
+        return result
 
 
 from tqdm import tqdm
@@ -208,23 +299,34 @@ def assert_split_resnet_correctness():
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
 def test_worker_node_server(port: int):
-    with tcp.create_server('localhost', port) as server:
-        client_sock, client_addr = server.accept()
+    try:
+        with tcp.create_server('localhost', port) as server:
+            client_sock, client_addr = server.accept()
 
-        orig = models.resnet50()
-        split = SplitResnet(orig)
+            orig = models.resnet50()
+            split = SplitResnet(orig)
 
-        while True:
-            header = tcp.recv_json(client_sock)
-            if 'terminate' in header:
-                break
+            while True:
+                header = tcp.recv_json(client_sock)
+                if 'terminate' in header:
+                    break
 
-            x = tcp.recv_tensor(client_sock)
-            with torch.no_grad():
-                y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
-                tcp.send_tensor(client_sock, y)
+                x = tcp.recv_tensor(client_sock)
+                with torch.no_grad():
+                    start = time.time()
+                    y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
+                    end = time.time()
 
-        client_sock.close()
+                    # 네트워크 딜레이 재현
+                    # time.sleep(0.02)
+                    
+                    tcp.send_json(client_sock, {'time' : end - start})
+                    tcp.send_tensor(client_sock, y)
+
+            client_sock.close()
+    except:
+        print('[Exception from worker node]')
+        tcp.traceback.print_exc()
 
 def assert_distributed_resnet_correctness():
     tcp.supress_immutable_tensor_warning()
@@ -240,25 +342,36 @@ def assert_distributed_resnet_correctness():
     progress.update()
     progress.close()
 
-    orig = models.resnet50()
-    split = SplitResnet(orig)
+    try:
+        orig = models.resnet50()
+        split = SplitResnet(orig)
 
-    worker_nodes = [
-        WorkerNode('localhost', 1111),
-        WorkerNode('localhost', 2222),
-    ]
-    distributed = DistributedResnet(split, worker_nodes)
+        worker_nodes = [
+            WorkerNode('localhost', 1111),
+            WorkerNode('localhost', 2222),
+        ]
+        distributed = DistributedResnet(split, worker_nodes)
 
-    assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
+        assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
 
-    tcp.send_json(worker_nodes[0].sock, {'terminate' : True})
-    tcp.send_json(worker_nodes[1].sock, {'terminate' : True})
+        distributed.runtime_record.print_runtime()
+        print('net local computation:', distributed.runtime_record.net_runtime_per_category('local computation'))
+        print('net network overhead:', distributed.runtime_record.net_runtime_per_category('network overhead'))
+        print('net concat:', distributed.runtime_record.net_runtime_per_category('concat'))
+
+        tcp.send_json(worker_nodes[0].sock, {'terminate' : True})
+        tcp.send_json(worker_nodes[1].sock, {'terminate' : True})
+    except:
+        print('[Exception from main server]')
+        tcp.traceback.print_exc()
 
     worker1.join()
     worker2.join()
 
 
 if __name__ == '__main__':
+    # import cProfile
+    # cProfile.run('assert_distributed_resnet_correctness()', sort = 'tottime')
     tcp.assert_tcp_communication()
     assert_distributed_resnet_correctness()
     assert_split_resnet_correctness()

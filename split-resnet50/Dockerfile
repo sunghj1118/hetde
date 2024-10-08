@@ -1,8 +1,10 @@
 FROM pytorch/pytorch
 
 RUN pip install Flask
+RUN apt-get update && apt-get -y install net-tools git
 
 COPY test.py test.py
+COPY runtime.py runtime.py
 COPY tcp.py tcp.py
 
 CMD ["python", "test.py"]

@@ -1,9 +1,10 @@
 
-from socket import socket, AF_INET, SOCK_STREAM, MSG_WAITALL
+from socket import socket, error, AF_INET, SOCK_STREAM, MSG_WAITALL
 import json
 import warnings
 import torch
 import numpy as np
+import traceback
 
 def send_u32(sock: socket, value: int):
     sock.send(value.to_bytes(4, byteorder = 'little'))
@@ -20,39 +21,84 @@ def recv_utf8(sock: socket) -> str:
     header_size = recv_u32(sock)
     return sock.recv(header_size).decode()
 
-def send_json(sock: socket, obj):
+def send_json(sock: socket, obj, print_time: bool = False):
+    t1 = time.time()
     encoded_msg = json.dumps(obj).encode()
+    t2 = time.time()
     send_u32(sock, len(encoded_msg))
     sock.send(encoded_msg)
+    t3 = time.time()
+    if print_time:
+        print('send_json: {:.7f} (encode json: {:.2f}%, send data: {:.2f}%)'.format(t3 - t1, (t2 - t1) / (t3 - t1) * 100, (t3 - t2) / (t3 - t1) * 100))
 
-def recv_json(sock: socket) -> str:
+def recv_json(sock: socket, print_time: bool = False) -> str:
+    t1 = time.time()
     header_size = recv_u32(sock)
-    return json.loads(sock.recv(header_size))
+    raw_bytes = sock.recv(header_size)
+    t2 = time.time()
+    result = json.loads(raw_bytes)
+    t3 = time.time()
 
-def send_tensor(sock: socket, tensor: torch.Tensor):
+    if print_time:
+        print('recv_json: {:.7f} (receive data: {:.2f}%, parse json: {:.2f}%)'.format(t3 - t1, (t2 - t1) / (t3 - t1) * 100, (t3 - t2) / (t3 - t1) * 100))
+    return result
+
+def send_tensor(sock: socket, tensor: torch.Tensor, print_time: bool = False):
+    t1 = time.time()
+
     header = json.dumps({'shape': tensor.shape})
     assert(tensor.dtype == torch.float32)
     send_utf8(sock, header)
+
+    t2 = time.time()
     
     encoded_tensor = tensor.numpy().tobytes()
+
+    t3 = time.time()
+
     send_u32(sock, len(encoded_tensor))
     sock.send(encoded_tensor)
+    t4 = time.time()
 
-def recv_tensor(sock: socket) -> torch.Tensor:
+    if print_time:
+        print('send_tensor: {:.7f} (send header: {:.2f}%, encoded tensor: {:.2f}%, send data: {:.2f}%)'.format(t4 - t1, (t2 - t1) / (t4 - t1) * 100, (t3 - t2) / (t4 - t1) * 100, (t4 - t3) / (t4 - t1) * 100))
+
+def recv_tensor(sock: socket, print_time: bool = False) -> torch.Tensor:
+    t1 = time.time()
     header = recv_json(sock)
+    t2 = time.time()
     tensor_size = recv_u32(sock)
     raw_bytes = sock.recv(tensor_size, MSG_WAITALL)
-    return torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(header['shape'])
+    t3 = time.time()
+    result = torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(header['shape'])
+    t4 = time.time()
+
+    if print_time:
+        print('recv_tensor: {:.7f} (receive header: {:.2f}%, receive data: {:.2f}%, reconstruct tensor: {:.2f}%)'.format(t4 - t1, (t2 - t1) / (t4 - t1) * 100, (t3 - t2) / (t4 - t1) * 100, (t4 - t3) / (t4 - t1) * 100))
+
+    return result
 
 def create_server(host: str, port: int, backlog: int = 10):
     listen_sock = socket(AF_INET, SOCK_STREAM)
-    listen_sock.bind((host, port))
-    listen_sock.listen(backlog)
+
+    try:
+        listen_sock.bind((host, port))
+        listen_sock.listen(backlog)
+    except error as e:
+        listen_sock.close()
+        raise e
+    
     return listen_sock
 
 def connect_server(host: str, port: int):
     sock = socket(AF_INET, SOCK_STREAM)
-    sock.connect((host, port))
+
+    try:
+        sock.connect((host, port))
+    except error as e:
+        sock.close()
+        raise e
+    
     return sock
 
 def supress_immutable_tensor_warning():
@@ -68,33 +114,38 @@ from tqdm import tqdm
 import time
 
 def test_tcp_server():
-    with socket(AF_INET, SOCK_STREAM) as listen_sock:
-        listen_sock.bind(('localhost', 9999))
-        listen_sock.listen(5)
-        client_sock, client_addr = listen_sock.accept()
-        send_json(client_sock, recv_json(client_sock))
-        send_tensor(client_sock, recv_tensor(client_sock))
-        client_sock.close()
+    try:
+        with create_server('localhost', 9999) as listen_sock:
+            client_sock, client_addr = listen_sock.accept()
+            send_json(client_sock, recv_json(client_sock))
+            send_tensor(client_sock, recv_tensor(client_sock))
+            client_sock.close()
+    except Exception as e:
+        print('[Exception from test server]')
+        traceback.print_exc()
 
 def test_tcp_client():
-    progress = tqdm(total = 3, desc = 'tcp communication assertion', postfix = 'connecting to server')
-    with socket(AF_INET, SOCK_STREAM) as sock:
-        sock.connect(('localhost', 9999))
-        progress.update()
+    try:
+        progress = tqdm(total = 3, desc = 'tcp communication assertion', postfix = 'connecting to server')
+        with connect_server('localhost', 9999) as sock:
+            progress.update()
 
-        progress.set_postfix_str('json')
-        sample_json = {'name' : 'haha', 'age' : 123}
-        send_json(sock, sample_json)
-        assert(recv_json(sock) == sample_json)
-        time.sleep(1)
-        progress.update()
+            progress.set_postfix_str('json')
+            sample_json = {'name' : 'haha', 'age' : 123}
+            send_json(sock, sample_json, print_time = True)
+            assert(recv_json(sock, print_time = True) == sample_json)
+            time.sleep(1)
+            progress.update()
 
-        progress.set_postfix_str('tensor')
-        sample_tensor = torch.rand(1, 3, 256, 256)
-        send_tensor(sock, sample_tensor)
-        assert(torch.equal(recv_tensor(sock), sample_tensor))
-        progress.update()
-        progress.close()
+            progress.set_postfix_str('tensor')
+            sample_tensor = torch.rand(1, 3, 256, 256)
+            send_tensor(sock, sample_tensor, print_time = True)
+            assert(torch.equal(recv_tensor(sock, print_time = True), sample_tensor))
+            progress.update()
+            progress.close()
+    except Exception as e:
+        print('[Exception from test client]')
+        traceback.print_exc()
 
 def assert_tcp_communication():
     supress_immutable_tensor_warning()
