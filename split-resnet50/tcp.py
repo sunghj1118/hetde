@@ -21,17 +21,31 @@ def recv_utf8(sock: socket) -> str:
     header_size = recv_u32(sock)
     return sock.recv(header_size).decode()
 
-def send_json(sock: socket, obj, print_time: bool = False):
+def send_json(sock: socket, obj):
+    encoded_msg = json.dumps(obj).encode()
+    send_u32(sock, len(encoded_msg))
+    sock.send(encoded_msg)
+
+def send_json_with_timestamp(sock: socket, obj):
     t1 = time.time()
     encoded_msg = json.dumps(obj).encode()
     t2 = time.time()
     send_u32(sock, len(encoded_msg))
     sock.send(encoded_msg)
     t3 = time.time()
-    if print_time:
-        print('send_json: {:.7f} (encode json: {:.2f}%, send data: {:.2f}%)'.format(t3 - t1, (t2 - t1) / (t3 - t1) * 100, (t3 - t2) / (t3 - t1) * 100))
+    send_json(sock, {
+        'total' : t3 - t1,
+        'encode json' : t2 - t1,
+        'send json' : t3 - t2
+    })
 
-def recv_json(sock: socket, print_time: bool = False) -> str:
+def recv_json(sock: socket):
+    header_size = recv_u32(sock)
+    raw_bytes = sock.recv(header_size)
+    result = json.loads(raw_bytes)
+    return result
+
+def recv_json_with_timestamp(sock: socket):
     t1 = time.time()
     header_size = recv_u32(sock)
     raw_bytes = sock.recv(header_size)
@@ -39,11 +53,28 @@ def recv_json(sock: socket, print_time: bool = False) -> str:
     result = json.loads(raw_bytes)
     t3 = time.time()
 
-    if print_time:
-        print('recv_json: {:.7f} (receive data: {:.2f}%, parse json: {:.2f}%)'.format(t3 - t1, (t2 - t1) / (t3 - t1) * 100, (t3 - t2) / (t3 - t1) * 100))
-    return result
+    timestamp = {
+        'send' : recv_json(sock),
+        'recv' : {
+            'total' : t3 - t2,
+            'receive data' : t2 - t1,
+            'decoded json' : t3 - t2,
+        }
+    }
+    return result, timestamp
 
-def send_tensor(sock: socket, tensor: torch.Tensor, print_time: bool = False):
+
+def send_tensor(sock: socket, tensor: torch.Tensor):
+    header = json.dumps({'shape': tensor.shape})
+    assert(tensor.dtype == torch.float32)
+    send_utf8(sock, header)
+    
+    encoded_tensor = tensor.numpy().tobytes()
+
+    send_u32(sock, len(encoded_tensor))
+    sock.send(encoded_tensor)
+
+def send_tensor_with_timestamp(sock: socket, tensor: torch.Tensor):
     t1 = time.time()
 
     header = json.dumps({'shape': tensor.shape})
@@ -58,25 +89,52 @@ def send_tensor(sock: socket, tensor: torch.Tensor, print_time: bool = False):
 
     send_u32(sock, len(encoded_tensor))
     sock.send(encoded_tensor)
+
     t4 = time.time()
 
-    if print_time:
-        print('send_tensor: {:.7f} (send header: {:.2f}%, encoded tensor: {:.2f}%, send data: {:.2f}%)'.format(t4 - t1, (t2 - t1) / (t4 - t1) * 100, (t3 - t2) / (t4 - t1) * 100, (t4 - t3) / (t4 - t1) * 100))
+    send_json(sock, {
+        'total' : t4 - t3,
+        'send header' : t2 - t1,
+        'encode tensor' : t3 - t2,
+        'send data' : t4 - t3,
+    })
 
-def recv_tensor(sock: socket, print_time: bool = False) -> torch.Tensor:
-    t1 = time.time()
+
+def recv_tensor(sock: socket) -> torch.Tensor:
     header = recv_json(sock)
-    t2 = time.time()
     tensor_size = recv_u32(sock)
     raw_bytes = sock.recv(tensor_size, MSG_WAITALL)
-    t3 = time.time()
     result = torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(header['shape'])
-    t4 = time.time()
-
-    if print_time:
-        print('recv_tensor: {:.7f} (receive header: {:.2f}%, receive data: {:.2f}%, reconstruct tensor: {:.2f}%)'.format(t4 - t1, (t2 - t1) / (t4 - t1) * 100, (t3 - t2) / (t4 - t1) * 100, (t4 - t3) / (t4 - t1) * 100))
 
     return result
+
+def recv_tensor_with_timestamp(sock: socket):
+    t1 = time.time()
+
+    header = recv_json(sock)
+
+    t2 = time.time()
+
+    tensor_size = recv_u32(sock)
+    raw_bytes = sock.recv(tensor_size, MSG_WAITALL)
+
+    t3 = time.time()
+
+    result = torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(header['shape'])
+
+    t4 = time.time()
+
+    timestamp = {
+        'send' : recv_json(sock),
+        'recv' : {
+            'total' : t4 - t1,
+            'receive header' : t2 - t1,
+            'receive data' : t3 - t2,
+            'reconstruct tensor' : t4 - t3,
+        }
+    }
+
+    return result, timestamp
 
 def create_server(host: str, port: int, backlog: int = 10):
     listen_sock = socket(AF_INET, SOCK_STREAM)
@@ -117,8 +175,8 @@ def test_tcp_server():
     try:
         with create_server('localhost', 9999) as listen_sock:
             client_sock, client_addr = listen_sock.accept()
-            send_json(client_sock, recv_json(client_sock))
-            send_tensor(client_sock, recv_tensor(client_sock))
+            send_json_with_timestamp(client_sock, recv_json(client_sock))
+            send_tensor_with_timestamp(client_sock, recv_tensor(client_sock))
             client_sock.close()
     except Exception as e:
         print('[Exception from test server]')
@@ -132,15 +190,19 @@ def test_tcp_client():
 
             progress.set_postfix_str('json')
             sample_json = {'name' : 'haha', 'age' : 123}
-            send_json(sock, sample_json, print_time = True)
-            assert(recv_json(sock, print_time = True) == sample_json)
+            send_json(sock, sample_json)
+            echo_json, timestamp = recv_json_with_timestamp(sock)
+            assert(echo_json == sample_json)
+            print('json echo timestamp', json.dumps(timestamp, indent = 4))
             time.sleep(1)
             progress.update()
 
             progress.set_postfix_str('tensor')
             sample_tensor = torch.rand(1, 3, 256, 256)
-            send_tensor(sock, sample_tensor, print_time = True)
-            assert(torch.equal(recv_tensor(sock, print_time = True), sample_tensor))
+            send_tensor(sock, sample_tensor)
+            echo_tensor, timestamp = recv_tensor_with_timestamp(sock)
+            print('tensor echo timestamp', json.dumps(timestamp, indent = 4))
+            assert(torch.equal(echo_tensor, sample_tensor))
             progress.update()
             progress.close()
     except Exception as e:
