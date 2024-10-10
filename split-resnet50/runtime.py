@@ -7,6 +7,24 @@ class RuntimeRecord:
         self.total_runtime = 0.0
         self.subcategories = []
 
+    def from_dict(data: dict, category_name: str, parent_category: Self = None) -> Self:
+        """
+        :param data: 아래와 같은 구조로 저장된 실행 시간 정보
+        
+        data = {
+            'total' : 0,
+            'subcategory1' : {
+                'total' : 0
+            }
+        }
+        """
+        record = RuntimeRecord(category_name, parent_category)
+        record.total_runtime = data['total']
+        for subcategory, subdata in data.items():
+            if subcategory != 'total':
+                record.subcategories.append(RuntimeRecord.from_dict(subdata, subcategory, record))
+        return record
+
     def create_subcategory(self, subcategory_name: str) -> Self:
         subcategory = RuntimeRecord(subcategory_name, parent_category = self)
         self.subcategories.append(subcategory)
@@ -53,3 +71,27 @@ if __name__ == '__main__':
     assert(record.net_runtime_per_category('concat') == (part1_concat.total_runtime + part2_concat.total_runtime))
 
     record.print_runtime()
+
+    data = {
+        'total' : 100,
+        'part1' : {
+            'total' : 70,
+            'conv' : {
+                'total' : 30
+            },
+            'concat' : {
+                'total' : 40
+            }
+        },
+        'part2' : {
+            'total' : 30,
+            'conv' : {
+                'total' : 15
+            },
+            'concat' : {
+                'total' : 15
+            }
+        }
+    }
+    record2 = RuntimeRecord.from_dict(data, 'Resnet')
+    record2.print_runtime()

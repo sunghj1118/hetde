@@ -87,6 +87,9 @@ class WorkerNode:
 
     def receive_inference_result(self):
         return tcp.recv_json(self.sock), tcp.recv_tensor(self.sock)
+    
+    def receive_inference_result_with_timestamp(self):
+        return tcp.recv_json_with_timestamp(self.sock), tcp.recv_tensor_with_timestamp(self.sock)
 
 
 class PartialConv2dProxy(torch.nn.Module):
@@ -114,6 +117,9 @@ class PartialConv2dProxy(torch.nn.Module):
         self.runtime_record = runtime_record
         self.local_computation = runtime_record.create_subcategory('local computation')
         self.network_overhead = runtime_record.create_subcategory('network overhead')
+
+        self.network_overhead.subcategories.append(0)
+        self.network_overhead.subcategories.append(0)
 
     def forward(self, x: torch.Tensor):
         """
@@ -144,7 +150,9 @@ class PartialConv2dProxy(torch.nn.Module):
         request_inference()와 한 쌍으로 사용되는 함수.
         조금 전에 보낸 요청에 대한 응답을 받고 실행 시간을 기록한다.
         """
-        header, result = self.worker_node.receive_inference_result()
+        (header, header_timestamp), (result, result_timestamp) = self.worker_node.receive_inference_result_with_timestamp()
+        self.network_overhead.subcategories[0] = RuntimeRecord.from_dict(header_timestamp, 'header')
+        self.network_overhead.subcategories[1] = RuntimeRecord.from_dict(result_timestamp, 'result')
 
         request_end_time = time.time()
         self.record_runtime(total_runtime = request_end_time - self.request_start_time, local_computation_runtime = header['time'])
@@ -320,8 +328,8 @@ def test_worker_node_server(port: int):
                     # 네트워크 딜레이 재현
                     # time.sleep(0.02)
                     
-                    tcp.send_json(client_sock, {'time' : end - start})
-                    tcp.send_tensor(client_sock, y)
+                    tcp.send_json_with_timestamp(client_sock, {'time' : end - start})
+                    tcp.send_tensor_with_timestamp(client_sock, y)
 
             client_sock.close()
     except:

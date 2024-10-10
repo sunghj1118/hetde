@@ -35,8 +35,12 @@ def send_json_with_timestamp(sock: socket, obj):
     t3 = time.time()
     send_json(sock, {
         'total' : t3 - t1,
-        'encode json' : t2 - t1,
-        'send json' : t3 - t2
+        'encode json' : {
+            'total' : t2 - t1
+        },
+        'send json' : {
+            'total' : t3 - t2
+        }
     })
 
 def recv_json(sock: socket):
@@ -53,13 +57,21 @@ def recv_json_with_timestamp(sock: socket):
     result = json.loads(raw_bytes)
     t3 = time.time()
 
+    send_timestamp = recv_json(sock)
+    recv_timestamp = {
+        'total' : t3 - t2,
+        'receive data' : {
+            'total' : t2 - t1
+        },
+        'decoded json' : {
+            'total' : t3 - t2
+        },
+    }
+
     timestamp = {
-        'send' : recv_json(sock),
-        'recv' : {
-            'total' : t3 - t2,
-            'receive data' : t2 - t1,
-            'decoded json' : t3 - t2,
-        }
+        'total' : send_timestamp['total'] + recv_timestamp['total'],
+        'send' : send_timestamp,
+        'recv' : recv_timestamp,
     }
     return result, timestamp
 
@@ -94,9 +106,15 @@ def send_tensor_with_timestamp(sock: socket, tensor: torch.Tensor):
 
     send_json(sock, {
         'total' : t4 - t3,
-        'send header' : t2 - t1,
-        'encode tensor' : t3 - t2,
-        'send data' : t4 - t3,
+        'send header' : {
+            'total' : t2 - t1
+        },
+        'encode tensor' : {
+            'total' : t3 - t2
+        },
+        'send data' : {
+            'total' : t4 - t3
+        }
     })
 
 
@@ -124,14 +142,24 @@ def recv_tensor_with_timestamp(sock: socket):
 
     t4 = time.time()
 
-    timestamp = {
-        'send' : recv_json(sock),
-        'recv' : {
-            'total' : t4 - t1,
-            'receive header' : t2 - t1,
-            'receive data' : t3 - t2,
-            'reconstruct tensor' : t4 - t3,
+    send_timestamp = recv_json(sock)
+    recv_timestamp = {
+        'total' : t4 - t1,
+        'receive header' : {
+            'total' : t2 - t1
+        },
+        'receive data' : {
+            'total' : t3 - t2
+        },
+        'reconstruct tensor' : {
+            'total' : t4 - t3
         }
+    }
+
+    timestamp = {
+        'total' : send_timestamp['total'] + recv_timestamp['total'],
+        'send' : send_timestamp,
+        'recv' : recv_timestamp,
     }
 
     return result, timestamp
