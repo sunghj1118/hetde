@@ -270,7 +270,7 @@ class SplitResnet(torch.nn.Module):
 
         out_channels_per_part = [base_channels] * num_splits
         
-        # Distribute the remainder channels
+        # 나머지 채널 수를 앞에서부터 하나씩 할당
         for i in range(remainder):
             out_channels_per_part[i] += 1
 
@@ -285,9 +285,19 @@ class DistributedResnet(torch.nn.Module):
         super(DistributedResnet, self).__init__()
         self.split_model = split_model
         self.runtime_record = RuntimeRecord('DistributedResnet')
+        self.worker_nodes = worker_nodes
 
         for name, layer in self.split_model.split_conv_dict.items():
-            rsetattr(self.split_model.model, name, DistributedConv2d(name, worker_nodes, self.runtime_record.create_subcategory(name)))
+            rsetattr(self.split_model.model, name, self.create_distributed_conv(name, layer))
+    
+    def create_distributed_conv(self, name: str, layer: SplitConv2d):
+        num_splits = len(layer.out_channels_per_part)
+        if num_splits > len(self.worker_nodes):
+            raise ValueError(f"Not enough worker nodes for layer {name}. "
+                             f"Required: {num_splits}, Available: {len(self.worker_nodes)}")
+        
+        return DistributedConv2d(name, self.worker_nodes[:num_splits], 
+                                 self.runtime_record.create_subcategory(name))
 
     def forward(self, x: torch.Tensor):
         start = time.time()
@@ -310,7 +320,13 @@ def assert_model_equality(model1: torch.nn.Module, model2: torch.nn.Module, inpu
             x = torch.rand(input_shape)
             y1 = model1(x)
             y2 = model2(x)
-            assert(torch.equal(y1, y2))
+            if not torch.equal(y1, y2):
+                print(f"Mismatch found in test {_+1}")
+                print(f"Max difference: {torch.max(torch.abs(y1 - y2))}")
+                print(f"Mean difference: {torch.mean(torch.abs(y1 - y2))}")
+                print(f"y1 shape: {y1.shape}, y2 shape: {y2.shape}")
+                print(f"y1 sum: {y1.sum()}, y2 sum: {y2.sum()}")
+                assert False, "Outputs do not match"
 
 
 def assert_split_conv_correctness():
@@ -327,7 +343,7 @@ def assert_split_conv_correctness():
 
 def assert_split_resnet_correctness():
     orig = models.resnet50()
-    split = SplitResnet(orig, 2)
+    split = SplitResnet(orig, 3)
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
 def test_worker_node_server(port: int):
@@ -336,7 +352,7 @@ def test_worker_node_server(port: int):
             client_sock, client_addr = server.accept()
 
             orig = models.resnet50()
-            split = SplitResnet(orig, 2)
+            split = SplitResnet(orig, 3)
 
             while True:
                 header = tcp.recv_json(client_sock)
@@ -363,26 +379,46 @@ def test_worker_node_server(port: int):
 def assert_distributed_resnet_correctness():
     tcp.supress_immutable_tensor_warning()
 
-    progress = tqdm(total = 1, desc = 'initializing worker nodes')
-    worker1 = Process(target = test_worker_node_server, args = (1111,))
-    worker2 = Process(target = test_worker_node_server, args = (2222,))
-    worker1.start()
-    worker2.start()
+    num_splits = 3
+    progress = tqdm(total = num_splits, desc = 'initializing worker nodes')
+    workers = []
 
-    time.sleep(1)
-
-    progress.update()
+    for i in range(num_splits):
+        port = 1111 + i
+        worker = Process(target = test_worker_node_server, args = (port,))
+        worker.start()
+        workers.append(worker)
+        time.sleep(1)
+        progress.update(1)
+    
     progress.close()
 
     try:
         orig = models.resnet50()
-        split = SplitResnet(orig)
+        split = SplitResnet(orig, num_splits)
 
-        worker_nodes = [
-            WorkerNode('localhost', 1111),
-            WorkerNode('localhost', 2222),
-        ]
+        worker_nodes = [WorkerNode('localhost', 1111 + i) for i in range(num_splits)]
         distributed = DistributedResnet(split, worker_nodes)
+
+
+        def test_split_resnet():
+            orig = models.resnet50()
+            split = SplitResnet(orig, num_splits)
+            
+            x = torch.randn(1, 3, 256, 256)
+            y1 = orig(x)
+            y2 = split(x)
+            
+            print(f"SplitResnet - Max difference: {torch.max(torch.abs(y1 - y2))}")
+            print(f"SplitResnet - Mean difference: {torch.mean(torch.abs(y1 - y2))}")
+            print(f"SplitResnet - y1 sum: {y1.sum()}, y2 sum: {y2.sum()}")
+            
+            assert torch.allclose(y1, y2, atol=1e-5), "SplitResnet output doesn't match original ResNet"
+
+        test_split_resnet()
+
+
+
 
         assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
 
@@ -391,20 +427,22 @@ def assert_distributed_resnet_correctness():
         print('net network overhead:', distributed.runtime_record.net_runtime_per_category('network overhead'))
         print('net concat:', distributed.runtime_record.net_runtime_per_category('concat'))
 
-        tcp.send_json(worker_nodes[0].sock, {'terminate' : True})
-        tcp.send_json(worker_nodes[1].sock, {'terminate' : True})
+        # 모든 worker node 종료
+        for worker_node in worker_nodes:
+            tcp.send_json(worker_node.sock, {'terminate': True})
     except:
         print('[Exception from main server]')
         tcp.traceback.print_exc()
-
-    worker1.join()
-    worker2.join()
+    finally:
+        # 모든 워커 프로세스가 종료될 때까지 대기
+        for worker in workers:
+            worker.join()
 
 
 if __name__ == '__main__':
     # import cProfile
     # cProfile.run('assert_distributed_resnet_correctness()', sort = 'tottime')
     tcp.assert_tcp_communication()
-    # assert_distributed_resnet_correctness()
-    assert_split_resnet_correctness()
+    # assert_split_resnet_correctness()
+    assert_distributed_resnet_correctness()
     # assert_split_conv_correctness()
