@@ -5,12 +5,20 @@ import warnings
 import torch
 import numpy as np
 import traceback
+import struct
 
 def send_u32(sock: socket, value: int):
     sock.send(value.to_bytes(4, byteorder = 'little'))
 
 def recv_u32(sock: socket) -> int:
     return int.from_bytes(sock.recv(4), byteorder = 'little')
+
+def send_f64(sock: socket, value: float):
+    sock.send(struct.pack('<d', value))
+
+def recv_f64(sock: socket) -> float:
+    result, = struct.unpack('<d', sock.recv(8))
+    return result
 
 def send_utf8(sock: socket, msg: str):
     encoded_msg = str.encode(msg)
@@ -122,6 +130,7 @@ def test_tcp_server():
     try:
         with create_server('localhost', 9999) as listen_sock:
             client_sock, client_addr = listen_sock.accept()
+            send_f64(client_sock, recv_f64(client_sock))
             send_json(client_sock, recv_json(client_sock))
             send_tensor(client_sock, recv_tensor(client_sock))
             client_sock.close()
@@ -131,9 +140,17 @@ def test_tcp_server():
 
 def test_tcp_client():
     try:
-        progress = tqdm(total = 3, desc = 'tcp communication assertion', postfix = 'connecting to server')
+        progress = tqdm(total = 4, desc = 'tcp communication assertion', postfix = 'connecting to server')
         with connect_server('localhost', 9999) as sock:
             progress.update()
+
+            progress.set_postfix_str('float')
+            sample_float = 3.141592
+            send_f64(sock, sample_float)
+            assert(recv_f64(sock) == sample_float)
+            time.sleep(1)
+            progress.update()
+
 
             progress.set_postfix_str('json')
             sample_json = {'name' : 'haha', 'age' : 123}
