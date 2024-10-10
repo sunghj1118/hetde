@@ -83,11 +83,12 @@ class WorkerNode:
         self.sock = tcp.connect_server(host, port)
 
     def request_inference(self, x: torch.Tensor, original_layer_name: str, part_index: int):
-        tcp.send_json(self.sock, {'original_layer_name' : original_layer_name, 'part_index' : part_index})
+        tcp.send_utf8(self.sock, original_layer_name)
+        tcp.send_u32(self.sock, part_index)
         tcp.send_tensor(self.sock, x)
 
     def receive_inference_result(self):
-        return tcp.recv_json(self.sock), tcp.recv_tensor(self.sock)
+        return tcp.recv_f64(self.sock), tcp.recv_tensor(self.sock)
 
 
 class PartialConv2dProxy(torch.nn.Module):
@@ -125,10 +126,10 @@ class PartialConv2dProxy(torch.nn.Module):
         start = time.time()
 
         self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
-        header, result = self.worker_node.receive_inference_result()
+        runtime, result = self.worker_node.receive_inference_result()
 
         end = time.time()
-        self.record_runtime(total_runtime = end - start, local_computation_runtime = header['time'])
+        self.record_runtime(total_runtime = end - start, local_computation_runtime = runtime)
         return result
     
     def request_inference(self, x: torch.Tensor):
@@ -145,10 +146,10 @@ class PartialConv2dProxy(torch.nn.Module):
         request_inference()와 한 쌍으로 사용되는 함수.
         조금 전에 보낸 요청에 대한 응답을 받고 실행 시간을 기록한다.
         """
-        header, result = self.worker_node.receive_inference_result()
+        runtime, result = self.worker_node.receive_inference_result()
 
         request_end_time = time.time()
-        self.record_runtime(total_runtime = request_end_time - self.request_start_time, local_computation_runtime = header['time'])
+        self.record_runtime(total_runtime = request_end_time - self.request_start_time, local_computation_runtime = runtime)
 
         return result
 
@@ -355,20 +356,21 @@ def test_worker_node_server(port: int):
             split = SplitResnet(orig, 3)
 
             while True:
-                header = tcp.recv_json(client_sock)
-                if 'terminate' in header:
+                original_layer_name = tcp.recv_utf8(client_sock)
+                if original_layer_name == 'terminate':
                     break
-
+                
+                part_index = tcp.recv_u32(client_sock)
                 x = tcp.recv_tensor(client_sock)
                 with torch.no_grad():
                     start = time.time()
-                    y = split.split_conv_dict[header['original_layer_name']].partial_convs[header['part_index']](x)
+                    y = split.split_conv_dict[original_layer_name].partial_convs[part_index](x)
                     end = time.time()
 
                     # 네트워크 딜레이 재현
                     # time.sleep(0.02)
                     
-                    tcp.send_json(client_sock, {'time' : end - start})
+                    tcp.send_f64(client_sock, end - start)
                     tcp.send_tensor(client_sock, y)
 
             client_sock.close()
@@ -429,7 +431,7 @@ def assert_distributed_resnet_correctness():
 
         # 모든 worker node 종료
         for worker_node in worker_nodes:
-            tcp.send_json(worker_node.sock, {'terminate': True})
+            tcp.send_utf8(worker_node.sock, 'terminate')
     except:
         print('[Exception from main server]')
         tcp.traceback.print_exc()

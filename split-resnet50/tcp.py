@@ -3,7 +3,6 @@ from socket import socket, error, AF_INET, SOCK_STREAM, MSG_WAITALL
 import json
 import warnings
 import torch
-import numpy as np
 import traceback
 import struct
 
