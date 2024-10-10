@@ -44,11 +44,13 @@ def recv_json(sock: socket, print_time: bool = False) -> str:
     return result
 
 def send_tensor(sock: socket, tensor: torch.Tensor, print_time: bool = False):
+    assert(tensor.dtype == torch.float32)
+
     t1 = time.time()
 
-    header = json.dumps({'shape': tensor.shape})
-    assert(tensor.dtype == torch.float32)
-    send_utf8(sock, header)
+    send_u32(sock, len(tensor.shape))
+    for dim in tensor.shape:
+        send_u32(sock, dim)
 
     t2 = time.time()
     
@@ -65,12 +67,15 @@ def send_tensor(sock: socket, tensor: torch.Tensor, print_time: bool = False):
 
 def recv_tensor(sock: socket, print_time: bool = False) -> torch.Tensor:
     t1 = time.time()
-    header = recv_json(sock)
+
+    shape_len = recv_u32(sock)
+    shape = [recv_u32(sock) for _ in range(shape_len)]
+
     t2 = time.time()
     tensor_size = recv_u32(sock)
     raw_bytes = sock.recv(tensor_size, MSG_WAITALL)
     t3 = time.time()
-    result = torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(header['shape'])
+    result = torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(shape)
     t4 = time.time()
 
     if print_time:
