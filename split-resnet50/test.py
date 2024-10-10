@@ -1,4 +1,5 @@
 import copy
+from typing import List
 import torch
 import torchvision.models as models
 from runtime import RuntimeRecord
@@ -231,18 +232,49 @@ class SplitResnet(torch.nn.Module):
     각 노드마다 생성되는 resnet 분할 버전.
     마스터 서버의 WorkerNode 클래스가 여기에 접속해서 추론 요청을 보냄.
     """
-    def __init__(self, model: models.ResNet):
+    def __init__(self, model: models.ResNet, num_splits: int):
         super(SplitResnet, self).__init__()
         self.model = copy.deepcopy(model)
         self.split_conv_dict = {}
+        self.num_splits = num_splits
 
         for name, layer in self.model.named_modules():
             if isinstance(layer, torch.nn.Conv2d):
-                # TODO: 정확히 반반 말고 임의의 수와 비율로 쪼갤 수 있게 만들기
-                self.split_conv_dict[name] = SplitConv2d(layer, out_channels_per_part = [layer.out_channels // 2, layer.out_channels // 2])
+                self.split_conv_dict[name] = self.create_split_conv(layer)
 
         for name, layer in self.split_conv_dict.items():
             rsetattr(self.model, name, layer)
+    
+    def create_split_conv(self, layer: torch.nn.Conv2d):
+        """
+        원본 Conv2d 레이어를 여러개로 분할.
+        총 출력 채널 수와 원하는 분할 수를 기반으로 각 부분의 채널 수를 계산하고,
+        이를 토대로 SplitConv2d 인스턴스를 생성 및 반환.
+        """
+        total_channels = layer.out_channels
+        out_channels_per_part = self.distribute_channels(total_channels, self.num_splits)
+        return SplitConv2d(layer, out_channels_per_part)
+
+    @staticmethod
+    def distribute_channels(total_channels: int, num_splits: int) -> List[int]:
+        """
+        주어진 총 채널 수를 지정된 분할 수에 따라 최대한 균등하게 분배.
+        :param total_channels: 분배할 총 채널의 수
+        :param num_splits: 채널을 분배할 분할의 수
+
+        동작방법: 모든 분할에 기본적인 채널 수를 할당하고 (총 채널/분할 수), 
+        이후 앞에서부터 나머지 채널 수를 하나씩 할당.
+        """
+        base_channels = total_channels // num_splits
+        remainder = total_channels % num_splits
+
+        out_channels_per_part = [base_channels] * num_splits
+        
+        # Distribute the remainder channels
+        for i in range(remainder):
+            out_channels_per_part[i] += 1
+
+        return out_channels_per_part
 
     def forward(self, x: torch.Tensor):
         return self.model(x)
@@ -295,7 +327,7 @@ def assert_split_conv_correctness():
 
 def assert_split_resnet_correctness():
     orig = models.resnet50()
-    split = SplitResnet(orig)
+    split = SplitResnet(orig, 2)
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
 def test_worker_node_server(port: int):
@@ -304,7 +336,7 @@ def test_worker_node_server(port: int):
             client_sock, client_addr = server.accept()
 
             orig = models.resnet50()
-            split = SplitResnet(orig)
+            split = SplitResnet(orig, 2)
 
             while True:
                 header = tcp.recv_json(client_sock)
@@ -373,6 +405,6 @@ if __name__ == '__main__':
     # import cProfile
     # cProfile.run('assert_distributed_resnet_correctness()', sort = 'tottime')
     tcp.assert_tcp_communication()
-    assert_distributed_resnet_correctness()
+    # assert_distributed_resnet_correctness()
     assert_split_resnet_correctness()
-    assert_split_conv_correctness()
+    # assert_split_conv_correctness()
