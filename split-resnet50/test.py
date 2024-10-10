@@ -172,9 +172,10 @@ class DistributedConv2d(torch.nn.Module):
     PartialConv2d를 직접 계산하는 대신 대응되는 worker node에
     요청을 보내는 PartialConv2dProxy를 사용한다.
     """
-    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], runtime_record: RuntimeRecord):
+    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], is_sequential: bool, runtime_record: RuntimeRecord):
         super(DistributedConv2d, self).__init__()
 
+        self.is_sequential = is_sequential
         self.partial_convs = torch.nn.ModuleList()
         self.runtime_record = runtime_record
         self.partial_convs_runtime = runtime_record.create_subcategory('partial convs')
@@ -187,8 +188,7 @@ class DistributedConv2d(torch.nn.Module):
         start = time.time()
 
         # 연결된 워커 노드에 부분적인 inference를 요청
-        sequential = False
-        if sequential:
+        if self.is_sequential:
             # case 1) 순차적 요청: 1번 워커의 응답이 온 뒤에 2번 워커에 요청을 보냄
             partial_outputs = [conv(x) for conv in self.partial_convs]
         else:
@@ -282,22 +282,22 @@ class SplitResnet(torch.nn.Module):
 
 
 class DistributedResnet(torch.nn.Module):
-    def __init__(self, split_model: SplitResnet, worker_nodes: list[WorkerNode]):
+    def __init__(self, split_model: SplitResnet, worker_nodes: list[WorkerNode], is_sequential: bool = False):
         super(DistributedResnet, self).__init__()
-        self.split_model = split_model
+        self.split_model = copy.deepcopy(split_model)
         self.runtime_record = RuntimeRecord('DistributedResnet')
         self.worker_nodes = worker_nodes
 
         for name, layer in self.split_model.split_conv_dict.items():
-            rsetattr(self.split_model.model, name, self.create_distributed_conv(name, layer))
+            rsetattr(self.split_model.model, name, self.create_distributed_conv(name, layer, is_sequential))
     
-    def create_distributed_conv(self, name: str, layer: SplitConv2d):
+    def create_distributed_conv(self, name: str, layer: SplitConv2d, is_sequential: bool):
         num_splits = len(layer.out_channels_per_part)
         if num_splits > len(self.worker_nodes):
             raise ValueError(f"Not enough worker nodes for layer {name}. "
                              f"Required: {num_splits}, Available: {len(self.worker_nodes)}")
         
-        return DistributedConv2d(name, self.worker_nodes[:num_splits], 
+        return DistributedConv2d(name, self.worker_nodes[:num_splits], is_sequential,
                                  self.runtime_record.create_subcategory(name))
 
     def forward(self, x: torch.Tensor):
@@ -306,6 +306,31 @@ class DistributedResnet(torch.nn.Module):
         end = time.time()
         self.runtime_record.total_runtime = end - start
         return result
+    
+    def analyze_overheads(self, input_shape: torch.Size, num_tests: int, print_complete_info: bool = False):
+        total_runtime = []
+        local_computation = []
+        network_overhead = []
+        concat_overhead = []
+
+        self.split_model.eval()
+        with torch.no_grad():
+            x = torch.rand(input_shape)
+            for i in range(num_tests):
+                self.forward(x)
+                total_runtime.append(self.runtime_record.total_runtime)
+                local_computation.append(self.runtime_record.net_runtime_per_category('local computation'))
+                network_overhead.append(self.runtime_record.net_runtime_per_category('network overhead'))
+                concat_overhead.append(self.runtime_record.net_runtime_per_category('concat'))
+
+            
+            if print_complete_info:
+                self.runtime_record.print_runtime()
+
+        print('total_runtime: avg = {:.7f}, samples ='.format(sum(total_runtime) / num_tests), total_runtime)
+        print('local computation: avg = {:.7f}, samples ='.format(sum(local_computation) / num_tests), local_computation)
+        print('network overhead: avg = {:.7f}, samples ='.format(sum(network_overhead) / num_tests), network_overhead)
+        print('concat overhead: avg = {:.7f}, samples ='.format(sum(concat_overhead) / num_tests), concat_overhead)
 
 
 from tqdm import tqdm
@@ -400,7 +425,8 @@ def assert_distributed_resnet_correctness():
         split = SplitResnet(orig, num_splits)
 
         worker_nodes = [WorkerNode('localhost', 1111 + i) for i in range(num_splits)]
-        distributed = DistributedResnet(split, worker_nodes)
+        distributed_sequential = DistributedResnet(split, worker_nodes, is_sequential = True)
+        distributed_parallel = DistributedResnet(split, worker_nodes, is_sequential = False)
 
 
         def test_split_resnet():
@@ -419,15 +445,15 @@ def assert_distributed_resnet_correctness():
 
         test_split_resnet()
 
+        input_shape = [1, 3, 256, 256]
+        assert_model_equality(orig, distributed_sequential, input_shape, num_tests = 2)
+        assert_model_equality(orig, distributed_parallel, input_shape, num_tests = 2)
 
-
-
-        assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 5)
-
-        distributed.runtime_record.print_runtime()
-        print('net local computation:', distributed.runtime_record.net_runtime_per_category('local computation'))
-        print('net network overhead:', distributed.runtime_record.net_runtime_per_category('network overhead'))
-        print('net concat:', distributed.runtime_record.net_runtime_per_category('concat'))
+        # 네트워크 오버헤드 분석
+        print('[DistributedResnet - sequential] overhead analysis')
+        distributed_sequential.analyze_overheads(input_shape, num_tests = 5)
+        print('[DistributedResnet - parallel] overhead analysis')
+        distributed_parallel.analyze_overheads(input_shape, num_tests = 5)
 
         # 모든 worker node 종료
         for worker_node in worker_nodes:
@@ -444,7 +470,7 @@ def assert_distributed_resnet_correctness():
 if __name__ == '__main__':
     # import cProfile
     # cProfile.run('assert_distributed_resnet_correctness()', sort = 'tottime')
-    tcp.assert_tcp_communication()
+    # tcp.assert_tcp_communication()
     # assert_split_resnet_correctness()
     assert_distributed_resnet_correctness()
     # assert_split_conv_correctness()
