@@ -330,7 +330,7 @@ def calculate_accuracy_and_latency(model, image_files, class_mapping):
 
         progress_bar.close()
 
-    # 정확도 및 평균 latency 계산
+
     accuracy = 100 * correct / total
     average_latency = sum(latencies) / len(latencies)
 
