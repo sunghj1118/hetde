@@ -1,5 +1,5 @@
 
-from socket import socket, error, AF_INET, SOCK_STREAM, MSG_WAITALL
+from socket import socket, error, AF_INET, SOCK_STREAM, MSG_WAITALL, SOL_SOCKET, SO_REUSEADDR
 import json
 import warnings
 import torch
@@ -92,6 +92,7 @@ def recv_tensor(sock: socket, print_time: bool = False) -> torch.Tensor:
 
 def create_server(host: str, port: int, backlog: int = 10):
     listen_sock = socket(AF_INET, SOCK_STREAM)
+    listen_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1) # close() 이후 발생하는 TIME_WAIT 상태 없애기
 
     try:
         listen_sock.bind((host, port))
@@ -121,7 +122,7 @@ def supress_immutable_tensor_warning():
     warnings.filterwarnings('ignore', category = UserWarning)
 
 
-from multiprocessing import Process
+import threading
 from tqdm import tqdm
 import time
 
@@ -147,7 +148,7 @@ def test_tcp_client():
             sample_float = 3.141592
             send_f64(sock, sample_float)
             assert(recv_f64(sock) == sample_float)
-            time.sleep(1)
+            time.sleep(0.1)
             progress.update()
 
 
@@ -155,7 +156,7 @@ def test_tcp_client():
             sample_json = {'name' : 'haha', 'age' : 123}
             send_json(sock, sample_json, print_time = True)
             assert(recv_json(sock, print_time = True) == sample_json)
-            time.sleep(1)
+            time.sleep(0.1)
             progress.update()
 
             progress.set_postfix_str('tensor')
@@ -172,19 +173,44 @@ def assert_tcp_communication():
     supress_immutable_tensor_warning()
     progress = tqdm(total = 1, desc = 'initializing server')
 
-    server = Process(target = test_tcp_server)
+    server = threading.Thread(target = test_tcp_server)
     server.start()
 
-    time.sleep(1)
+    time.sleep(0.1)
     progress.update()
     progress.close()
 
-    client = Process(target = test_tcp_client)
+    client = threading.Thread(target = test_tcp_client)
     client.start()
 
     server.join()
     client.join()
 
 
+
+def test_tcp_server_listen_only():
+    try:
+        with create_server('localhost', 9999) as listen_sock:
+            client_sock, client_addr = listen_sock.accept()
+            send_u32(client_sock, recv_u32(client_sock))
+            client_sock.close()
+    except Exception as e:
+        print('[Exception from test server]')
+        traceback.print_exc()
+    
+def assert_immediate_socket_reuse():
+    for i in tqdm(range(5), desc = 'immediate socket reuse assertion'):
+        server = threading.Thread(target = test_tcp_server_listen_only)
+        server.start()
+        time.sleep(0.1)
+        client = connect_server('localhost', 9999)
+
+        send_u32(client, i)
+        assert(recv_u32(client) == i)
+
+        client.close()
+        server.join()
+
 if __name__ == '__main__':
     assert_tcp_communication()
+    assert_immediate_socket_reuse()

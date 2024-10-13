@@ -1,5 +1,5 @@
 import copy
-from typing import List
+from typing import List, Callable
 import torch
 import torchvision.models as models
 from runtime import RuntimeRecord
@@ -281,12 +281,15 @@ class SplitResnet(torch.nn.Module):
         return self.model(x)
 
 
+from tqdm import tqdm
+
 class DistributedResnet(torch.nn.Module):
     def __init__(self, split_model: SplitResnet, worker_nodes: list[WorkerNode], is_sequential: bool = False):
         super(DistributedResnet, self).__init__()
         self.split_model = copy.deepcopy(split_model)
         self.runtime_record = RuntimeRecord('DistributedResnet')
         self.worker_nodes = worker_nodes
+        self.is_sequential = is_sequential
 
         for name, layer in self.split_model.split_conv_dict.items():
             rsetattr(self.split_model.model, name, self.create_distributed_conv(name, layer, is_sequential))
@@ -307,7 +310,7 @@ class DistributedResnet(torch.nn.Module):
         self.runtime_record.total_runtime = end - start
         return result
     
-    def analyze_overheads(self, input_shape: torch.Size, num_tests: int, print_complete_info: bool = False):
+    def analyze_overheads(self, input_shape: torch.Size, num_tests: int, outer_tqdm_progress: tqdm | None, print_complete_info: bool = False):
         total_runtime = []
         local_computation = []
         network_overhead = []
@@ -316,7 +319,7 @@ class DistributedResnet(torch.nn.Module):
         self.split_model.eval()
         with torch.no_grad():
             x = torch.rand(input_shape)
-            for i in range(num_tests):
+            for _ in tqdm(range(num_tests), desc = 'measuring overhead', file = sys.stdout, position = 1, leave = False):
                 self.forward(x)
                 total_runtime.append(self.runtime_record.total_runtime)
                 local_computation.append(self.runtime_record.net_runtime_per_category('local computation'))
@@ -326,23 +329,29 @@ class DistributedResnet(torch.nn.Module):
             
             if print_complete_info:
                 self.runtime_record.print_runtime()
+        
+        if outer_tqdm_progress is not None:
+            outer_tqdm_progress.update()
+            # 이어지는 첫 출력이 새로운 줄이 아니라 바깥 루프의 tqdm 출력 뒷부분에 이어지길래
+            # 명시적으로 다음 줄로 넘겨서 출력이 깔끔하게 보이게 만들었음
+            print()
 
-        print('total_runtime: avg = {:.7f}, samples ='.format(sum(total_runtime) / num_tests), total_runtime)
-        print('local computation: avg = {:.7f}, samples ='.format(sum(local_computation) / num_tests), local_computation)
-        print('network overhead: avg = {:.7f}, samples ='.format(sum(network_overhead) / num_tests), network_overhead)
-        print('concat overhead: avg = {:.7f}, samples ='.format(sum(concat_overhead) / num_tests), concat_overhead)
+        print('- total_runtime: avg = {:.7f}, samples ='.format(sum(total_runtime) / num_tests), total_runtime)
+        print('- local computation: avg = {:.7f}, samples ='.format(sum(local_computation) / num_tests), local_computation)
+        print('- network overhead: avg = {:.7f}, samples ='.format(sum(network_overhead) / num_tests), network_overhead)
+        print('- concat overhead: avg = {:.7f}, samples ='.format(sum(concat_overhead) / num_tests), concat_overhead)
 
 
-from tqdm import tqdm
-from multiprocessing import Process
+import threading
 import time
+import sys
 
 def assert_model_equality(model1: torch.nn.Module, model2: torch.nn.Module, input_shape: torch.Size, num_tests: int = 100):
     model1.eval()
     model2.eval()
     with torch.no_grad():
         desc = 'model equality assertion ({} vs {})'.format(model1._get_name(), model2._get_name())
-        for _ in tqdm(range(num_tests), desc):
+        for _ in tqdm(range(num_tests), desc, file = sys.stdout):
             x = torch.rand(input_shape)
             y1 = model1(x)
             y2 = model2(x)
@@ -372,13 +381,10 @@ def assert_split_resnet_correctness():
     split = SplitResnet(orig, 3)
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
-def test_worker_node_server(port: int):
+def test_worker_node_server(port: int, split: SplitResnet):
     try:
         with tcp.create_server('localhost', port) as server:
             client_sock, client_addr = server.accept()
-
-            orig = models.resnet50()
-            split = SplitResnet(orig, 3)
 
             while True:
                 original_layer_name = tcp.recv_utf8(client_sock)
@@ -403,57 +409,33 @@ def test_worker_node_server(port: int):
         print('[Exception from worker node]')
         tcp.traceback.print_exc()
 
-def assert_distributed_resnet_correctness():
+
+def run_test_on_distributed_env(num_workers: int, test: Callable[[list[WorkerNode], models.ResNet, SplitResnet], None], port_offset: int = 1000, use_pretrained_resnet = False):
     tcp.supress_immutable_tensor_warning()
 
-    num_splits = 3
-    progress = tqdm(total = num_splits, desc = 'initializing worker nodes')
+    progress = tqdm(total = 2, desc = 'initializing worker node model', file = sys.stdout, leave = False)
+    orig = models.resnet50(pretrained = use_pretrained_resnet)
+    progress.update()
+    split = SplitResnet(orig, num_workers)
+    progress.update()
+
+    progress = tqdm(total = num_workers, desc = 'initializing worker nodes', file = sys.stdout, leave = False)
     workers = []
 
-    for i in range(num_splits):
-        port = 1111 + i
-        worker = Process(target = test_worker_node_server, args = (port,))
+    for i in range(num_workers):
+        port = port_offset + i
+        worker = threading.Thread(target = test_worker_node_server, args = (port, split))
         worker.start()
         workers.append(worker)
-        time.sleep(1)
         progress.update(1)
     
+    time.sleep(0.2)
     progress.close()
 
     try:
-        orig = models.resnet50()
-        split = SplitResnet(orig, num_splits)
+        worker_nodes = [WorkerNode('localhost', port_offset + i) for i in tqdm(range(num_workers), desc = 'connecting to worker nodes', file = sys.stdout, leave = False)]
 
-        worker_nodes = [WorkerNode('localhost', 1111 + i) for i in range(num_splits)]
-        distributed_sequential = DistributedResnet(split, worker_nodes, is_sequential = True)
-        distributed_parallel = DistributedResnet(split, worker_nodes, is_sequential = False)
-
-
-        def test_split_resnet():
-            orig = models.resnet50()
-            split = SplitResnet(orig, num_splits)
-            
-            x = torch.randn(1, 3, 256, 256)
-            y1 = orig(x)
-            y2 = split(x)
-            
-            print(f"SplitResnet - Max difference: {torch.max(torch.abs(y1 - y2))}")
-            print(f"SplitResnet - Mean difference: {torch.mean(torch.abs(y1 - y2))}")
-            print(f"SplitResnet - y1 sum: {y1.sum()}, y2 sum: {y2.sum()}")
-            
-            assert torch.allclose(y1, y2, atol=1e-5), "SplitResnet output doesn't match original ResNet"
-
-        test_split_resnet()
-
-        input_shape = [1, 3, 256, 256]
-        assert_model_equality(orig, distributed_sequential, input_shape, num_tests = 2)
-        assert_model_equality(orig, distributed_parallel, input_shape, num_tests = 2)
-
-        # 네트워크 오버헤드 분석
-        print('[DistributedResnet - sequential] overhead analysis')
-        distributed_sequential.analyze_overheads(input_shape, num_tests = 5)
-        print('[DistributedResnet - parallel] overhead analysis')
-        distributed_parallel.analyze_overheads(input_shape, num_tests = 5)
+        test(worker_nodes, orig, split)
 
         # 모든 worker node 종료
         for worker_node in worker_nodes:
@@ -463,14 +445,153 @@ def assert_distributed_resnet_correctness():
         tcp.traceback.print_exc()
     finally:
         # 모든 워커 프로세스가 종료될 때까지 대기
+        progress = tqdm(total = num_workers, desc = 'waiting worker node termination', file = sys.stdout, leave = False)
         for worker in workers:
             worker.join()
+            progress.update()
+
+
+def assert_distributed_resnet_correctness(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    distributed = DistributedResnet(split, worker_nodes, is_sequential = True)
+    assert_model_equality(orig, distributed, [1, 3, 256, 256], num_tests = 2)
+
+
+def measure_distributed_resnet_overheads(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    progress = tqdm(total = 2, desc = 'initializing distributed models', file = sys.stdout, leave = False)
+
+    progress.set_postfix_str('sequential version')
+    distributed_sequential = DistributedResnet(split, worker_nodes, is_sequential = True)
+    progress.update()
+
+    progress.set_postfix_str('parallel version')
+    distributed_parallel = DistributedResnet(split, worker_nodes, is_sequential = False)
+    progress.update()
+    progress.close()
+
+
+    # 네트워크 오버헤드 분석
+    input_shape = [1, 3, 256, 256]
+
+    progress = tqdm(total = 2, desc = 'measuring distributed model overhead', file = sys.stdout, position = 0, leave = False)
+    progress.set_postfix_str('running sequential version')
+    distributed_sequential.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = progress)
+
+    progress.set_postfix_str('running parallel version')
+    distributed_parallel.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = progress)
+    progress.close()
+
+
+import os
+from PIL import Image
+import torchvision.transforms as transforms
+
+image_repo_path = "imagenet-sample-images"
+class_mapping_path = "942d3a0ac09ec9e5eb3a/imagenet1000_clsidx_to_labels.txt"
+
+def load_class_mapping(mapping_path):
+    with open(mapping_path, 'r') as f:
+        class_mapping = eval(f.read())
+    return class_mapping
+
+def load_image(image_path):
+    img = Image.open(image_path).convert('RGB')
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(256),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    img_tensor = preprocess(img).unsqueeze(0)
+    return img_tensor
+
+
+
+def calculate_accuracy_and_latency(model: torch.nn.Module, image_files: list[str], class_mapping: dict):
+    correct = 0
+    total = 0
+    latencies = []
+    model.eval()
+
+    with torch.no_grad():
+        progress_bar = tqdm(total=len(image_files), desc="Calculating accuracy and latency", file = sys.stdout, position = 1, leave = False)
+
+        for image_file in image_files:
+            input_tensor = load_image(image_file)
+
+            start_time = time.time()
+            outputs = model(input_tensor)
+            end_time = time.time()
+            latency = end_time - start_time
+            latencies.append(latency)
+
+            # 파일 이름에서 WordNet ID와 실제 정답 클래스 추출
+            file_name = os.path.basename(image_file)  # 파일명 예: 'n01440764_tench.JPEG' 또는 'n01622779_great_grey_owl.JPEG'
+            true_label = '_'.join(file_name.split('_')[1:]).split('.')[0]  # 'tench' 또는 'great_grey_owl'
+            true_label = true_label.replace('_', ' ')
+
+            # 예측한 클래스 선택
+            _, predicted = torch.max(outputs, 1)
+            predicted_label = predicted.item()
+
+            # 예측한 클래스가 실제 클래스와 일치하는지 확인 (여기서는 정답 클래스 true_label과 비교)
+            if true_label in class_mapping[predicted_label]:
+                correct += 1
+
+            total += 1
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+
+    accuracy = 100 * correct / total
+    average_latency = sum(latencies) / len(latencies)
+
+    return accuracy, average_latency
+
+
+
+def measure_distributed_resnet_accuracy_and_latency(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    progress = tqdm(total = 3, desc = 'measuring distributed model accuracy and latency', file = sys.stdout, position = 0)
+
+    # ImageNet1K 테스트 데이터 불러오기 (클래스마다 이미지 1개)
+    progress.set_postfix_str('loading test data')
+    class_mapping = load_class_mapping(class_mapping_path)
+    assert(len(class_mapping) == 1000)
+
+    image_files = [os.path.join(image_repo_path, f) for f in os.listdir(image_repo_path) if f.endswith('.JPEG')]
+    assert(len(image_files) == 1000)
+    progress.update()
+
+    # 1000개 다 돌리니까 너무 오래걸려서 앞부분만 테스트
+    image_files = image_files[:20]
+    
+
+    # 원본 ResNet의 정확도 및 latency 측정
+    progress.set_postfix_str('running original model')
+    orig_accuracy, orig_latency = calculate_accuracy_and_latency(orig, image_files, class_mapping)
+    progress.update()
+
+    # Distributed ResNet의 정확도 및 latency 측정
+    progress.set_postfix_str('running distributed model')
+    distributed = DistributedResnet(split, worker_nodes, is_sequential = False)
+    distributed_accuracy, distributed_latency = calculate_accuracy_and_latency(distributed, image_files, class_mapping)
+    progress.update()
+    progress.close()
+
+    print(f"- Original ResNet Accuracy: {orig_accuracy:.2f}%")
+    print(f"- Original ResNet Latency: {orig_latency:.6f} seconds")
+    print(f"- Distributed ResNet Accuracy: {distributed_accuracy:.2f}%")
+    print(f"- Distributed ResNet Latency: {distributed_latency:.6f} seconds")
+
 
 
 if __name__ == '__main__':
     # import cProfile
     # cProfile.run('assert_distributed_resnet_correctness()', sort = 'tottime')
     # tcp.assert_tcp_communication()
-    # assert_split_resnet_correctness()
-    assert_distributed_resnet_correctness()
+    assert_split_resnet_correctness()
+    run_test_on_distributed_env(num_workers = 3, test = assert_distributed_resnet_correctness)
+    run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_overheads)
+    run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True)
+    # time.sleep(1)
     # assert_split_conv_correctness()
