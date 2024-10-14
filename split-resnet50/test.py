@@ -310,7 +310,7 @@ class DistributedResnet(torch.nn.Module):
         self.runtime_record.total_runtime = end - start
         return result
     
-    def analyze_overheads(self, input_shape: torch.Size, num_tests: int, outer_tqdm_progress: tqdm | None, print_complete_info: bool = False):
+    def analyze_overheads(self, input_shape: torch.Size, num_tests: int, outer_tqdm_progress: tqdm | None):
         total_runtime = []
         local_computation = []
         network_overhead = []
@@ -325,10 +325,6 @@ class DistributedResnet(torch.nn.Module):
                 local_computation.append(self.runtime_record.net_runtime_per_category('local computation'))
                 network_overhead.append(self.runtime_record.net_runtime_per_category('network overhead'))
                 concat_overhead.append(self.runtime_record.net_runtime_per_category('concat'))
-
-            
-            if print_complete_info:
-                self.runtime_record.print_runtime()
         
         if outer_tqdm_progress is not None:
             outer_tqdm_progress.update()
@@ -480,6 +476,14 @@ def measure_distributed_resnet_overheads(worker_nodes: list[WorkerNode], orig: m
     distributed_parallel.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = progress)
     progress.close()
 
+    print(f"sequential version distributed part total runtime: {distributed_sequential.runtime_record.net_runtime_per_category('partial convs'):.7f}")
+    for i in range(len(worker_nodes)):
+        print(f"worker node {i} total runtime: {distributed_sequential.runtime_record.net_runtime_per_category(f'worker {i}'):.7f}")
+
+    print(f"parallel version distributed part total runtime: {distributed_parallel.runtime_record.net_runtime_per_category('partial convs'):.7f}")
+    for i in range(len(worker_nodes)):
+        print(f"worker node {i} total runtime: {distributed_parallel.runtime_record.net_runtime_per_category(f'worker {i}'):.7f}")
+
 
 import os
 from PIL import Image
@@ -589,9 +593,14 @@ if __name__ == '__main__':
     # import cProfile
     # cProfile.run('assert_distributed_resnet_correctness()', sort = 'tottime')
     # tcp.assert_tcp_communication()
-    assert_split_resnet_correctness()
-    run_test_on_distributed_env(num_workers = 3, test = assert_distributed_resnet_correctness)
-    run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_overheads)
-    run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True)
-    # time.sleep(1)
     # assert_split_conv_correctness()
+    # assert_split_resnet_correctness()
+    # run_test_on_distributed_env(num_workers = 3, test = assert_distributed_resnet_correctness)
+    run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_overheads)
+    # run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True)
+
+    # 실험: 워커 노드의 수를 하나씩 늘려가며 실행 시간이 얼마나 늘어나는지 측정
+    # 예측: 총 데이터 전송량이 노드 수에 비례하므로 선형적인 관계를 가질 것임
+    # 결과: 로컬 환경에서 실행하는 것을 기준으로 실제로 실행 시간이 분할 횟수에 선형적으로 비례하는 것으로 보임
+    # for num_workers in range(2, 15):
+    #     run_test_on_distributed_env(num_workers, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = False)
