@@ -115,9 +115,12 @@ if __name__ == "__main__":
 
     args = argparse.ArgumentParser()
     args.add_argument("--rank", type=int, default=0)
-    rank = args.parse_args().rank
+    args.add_argument("--addr", type=str, default='127.0.0.1')
+    args = args.parse_args()
+    rank = args.rank
+    master_addr = args.addr
 
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = '29500'
 
     world_size = 4
