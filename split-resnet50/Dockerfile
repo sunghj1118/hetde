@@ -10,6 +10,8 @@ RUN git clone https://gist.github.com/942d3a0ac09ec9e5eb3a.git
 COPY test.py test.py
 COPY runtime.py runtime.py
 COPY tcp.py tcp.py
+COPY pruning_test.py pruning_test.py
+COPY rpc_test.py rpc_test.py
 
 CMD ["python", "test.py"]
 
