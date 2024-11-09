@@ -33,7 +33,6 @@ class RPCWorkerNode:
 def main(rank: int):
     # Initialize RPC for each device role
     print(f"Rank {rank} initialized RPC")
-    # rpc.init_rpc(f"worker{rank}", rank=rank, world_size=world_size)
 
     rpc.init_rpc(
         f"worker{rank}",
@@ -50,6 +49,13 @@ def main(rank: int):
         
         input_shape = [1, 3, 256, 256]
         assert_model_equality(orig, distributed, input_shape, num_tests = 5)
+
+        distributed.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = None)
+
+        print(f"parallel version distributed part total runtime: {distributed.runtime_record.net_runtime_per_category('partial convs'):.7f}")
+        for i in range(len(worker_nodes)):
+            print(f"worker node {i} total runtime: {distributed.runtime_record.net_runtime_per_category(f'worker {i}'):.7f}")
+
         print('Finished master server routine')
 
     rpc.shutdown()

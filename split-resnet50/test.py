@@ -377,10 +377,12 @@ def assert_split_resnet_correctness():
     split = SplitResnet(orig, 3)
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
-def test_worker_node_server(port: int, split: SplitResnet):
+def test_worker_node_server(port: int, split: SplitResnet, host: str = 'localhost'):
     try:
         with tcp.create_server('localhost', port) as server:
+            print(f'server:{port} running')
             client_sock, client_addr = server.accept()
+            print(f'server:{port} accepted client')
 
             while True:
                 original_layer_name = tcp.recv_utf8(client_sock)
@@ -388,6 +390,8 @@ def test_worker_node_server(port: int, split: SplitResnet):
                     break
                 
                 part_index = tcp.recv_u32(client_sock)
+
+                # print(f"server:{port} received request - {original_layer_name}::{part_index}")
                 x = tcp.recv_tensor(client_sock)
                 with torch.no_grad():
                     start = time.time()
