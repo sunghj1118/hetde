@@ -33,6 +33,14 @@ class IWisePruningConv2DKernels(prune.BasePruningMethod):
         return mask
 
 
+"""
+입력 채널의 pruning 여부를 True/False 리스트로 반환
+ex) [True, False, False] => 첫 번째 입력 채널과 곱해지는 weigth가 모두 0이라는 뜻
+"""
+def is_input_channel_pruned(conv: torch.nn.Conv2d):
+    return (torch.sum(conv.weight_mask, dim = [0, 2, 3]) == 0).tolist()
+
+
 if __name__ == '__main__':
     conv_layer = nn.Conv2d(in_channels=4, out_channels=3, kernel_size=3, padding=1)
     a = 0.4  # Prune the lowest 40% of kernels
@@ -41,6 +49,9 @@ if __name__ == '__main__':
     print('mask:', conv_layer.weight_mask)
     IWisePruningConv2DKernels.apply(conv_layer, 'weight', amount=a)
     print('mask:', conv_layer.weight_mask)
+
+    # Find which input channels were pruned
+    print('is input channel pruned:', is_input_channel_pruned(conv_layer))
 
     # prune.remove(conv_layer, 'weight') to remove the mask and the weight_orig while applying the mask to the weight 
 
