@@ -7,6 +7,10 @@ RUN apt-get update && apt-get -y install net-tools git
 RUN git clone https://github.com/EliSchwartz/imagenet-sample-images.git
 RUN git clone https://gist.github.com/942d3a0ac09ec9e5eb3a.git
 
+# ResNet50 pretrained weight 다운로드
+COPY warmup.py warmup.py
+RUN python warmup.py
+
 COPY test.py test.py
 COPY runtime.py runtime.py
 COPY tcp.py tcp.py
