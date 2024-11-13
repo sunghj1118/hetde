@@ -7,7 +7,7 @@ RUN apt-get update && apt-get -y install net-tools git
 RUN git clone https://github.com/EliSchwartz/imagenet-sample-images.git
 RUN git clone https://gist.github.com/942d3a0ac09ec9e5eb3a.git
 
-# ResNet50 pretrained weight 다운로드
+# ResNet50 pretrained weight, cifar10 데이터셋 다운로드
 COPY warmup.py warmup.py
 RUN python warmup.py
 
@@ -18,6 +18,7 @@ COPY pruning_test.py pruning_test.py
 COPY rpc_test.py rpc_test.py
 COPY rpc_resnet.py rpc_resnet.py
 COPY mp_resnet.py mp_resnet.py
+COPY cifar_resnet.py cifar_resnet.py
 
 CMD ["python", "test.py"]
 
