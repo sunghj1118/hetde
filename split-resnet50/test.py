@@ -548,6 +548,17 @@ def load_image(image_path):
 
 
 
+# ImageNet1K 테스트 데이터 불러오기 (클래스마다 이미지 1개)
+class_mapping = load_class_mapping(class_mapping_path)
+assert(len(class_mapping) == 1000)
+
+image_files = [os.path.join(image_repo_path, f) for f in os.listdir(image_repo_path) if f.endswith('.JPEG')]
+assert(len(image_files) == 1000)
+
+# 1000개 다 돌리니까 너무 오래걸려서 앞부분만 테스트
+image_files = image_files[:20]
+
+
 def calculate_accuracy_and_latency(model: torch.nn.Module, image_files: list[str], class_mapping: dict):
     correct = 0
     total = 0
@@ -591,21 +602,17 @@ def calculate_accuracy_and_latency(model: torch.nn.Module, image_files: list[str
     return accuracy, average_latency
 
 
+def measure_pruned_split_resnet_accuracy(prune_amount: float):
+    orig = models.resnet50(pretrained = True)
+    prune_all_conv_layers(orig, prune_amount)
+
+    split = SplitResnet(orig, 3)
+    accuracy, latency = calculate_accuracy_and_latency(split, image_files, class_mapping)
+    print(f"- {prune_amount * 100}% Pruned Split ResNet Accuracy: {accuracy:.2f}%")
+
+
 def measure_distributed_resnet_accuracy_and_latency(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
-    progress = tqdm(total = 3, desc = 'measuring distributed model accuracy and latency', file = sys.stdout, position = 0)
-
-    # ImageNet1K 테스트 데이터 불러오기 (클래스마다 이미지 1개)
-    progress.set_postfix_str('loading test data')
-    class_mapping = load_class_mapping(class_mapping_path)
-    assert(len(class_mapping) == 1000)
-
-    image_files = [os.path.join(image_repo_path, f) for f in os.listdir(image_repo_path) if f.endswith('.JPEG')]
-    assert(len(image_files) == 1000)
-    progress.update()
-
-    # 1000개 다 돌리니까 너무 오래걸려서 앞부분만 테스트
-    image_files = image_files[:20]
-    
+    progress = tqdm(total = 2, desc = 'measuring distributed model accuracy and latency', file = sys.stdout, position = 0)
 
     # 원본 ResNet의 정확도 및 latency 측정
     progress.set_postfix_str('running original model')
@@ -633,11 +640,13 @@ if __name__ == '__main__':
     # assert_split_conv_correctness()
     # assert_split_resnet_correctness()
     # assert_pruned_split_resnet_correctness()
+    for prune_amount in [0, 0.01, 0.05, 0.1, 0.3, 0.5]:
+        measure_pruned_split_resnet_accuracy(prune_amount)
     # run_test_on_distributed_env(num_workers = 3, test = assert_distributed_resnet_correctness)
     # run_test_on_distributed_env(num_workers = 3, test = assert_distributed_resnet_correctness, prune_amount = 0.4)
     # run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_overheads)
     # run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True)
-    run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True, prune_amount = 0.05)
+    # run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True, prune_amount = 0.5)
 
     # 실험: 워커 노드의 수를 하나씩 늘려가며 실행 시간이 얼마나 늘어나는지 측정
     # 예측: 총 데이터 전송량이 노드 수에 비례하므로 선형적인 관계를 가질 것임
