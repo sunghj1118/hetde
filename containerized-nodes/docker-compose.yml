@@ -1,0 +1,38 @@
+version: '3'
+services:
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile.master
+    container_name: master_node
+    depends_on:
+      - worker1
+      - worker2
+    networks:
+      - distributed_network
+
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker_node_1
+    networks:
+      - distributed_network
+    environment:
+      - WORKER_NAME=worker_node_1
+      - PORT=1001
+
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker_node_2
+    networks:
+      - distributed_network
+    environment:
+      - WORKER_NAME=worker_node_2
+      - PORT=1002
+
+networks:
+  distributed_network:
+    driver: bridge
