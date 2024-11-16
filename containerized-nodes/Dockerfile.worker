@@ -1,13 +1,16 @@
-# Use PyTorch official image as base
 FROM pytorch/pytorch
 
-# Install necessary packages
+
 RUN pip install Flask
 RUN apt-get update && apt-get -y install net-tools
 
-# Copy Python files to the container
+
 COPY worker.py worker.py
 COPY tcp.py tcp.py
 
-# Set command to run worker node server
-CMD ["python", "worker.py"]
+# 환경변수 추가
+ENV PORT=10001
+
+
+CMD ["sh", "-c", "python worker.py"]
+

@@ -1,6 +1,5 @@
 import torch
 import copy
-import threading
 import time
 import sys
 from tqdm import tqdm
@@ -9,45 +8,7 @@ import tcp
 import torchvision.models as models
 from runtime import RuntimeRecord
 import functools
-from worker import WorkerNode
-from worker import PartialConv2d
-
-
-class PartialConv2dProxy(torch.nn.Module):
-    """
-    WorkerNode를 통해 연산을 처리하는 PartialConv2d의 프록시
-    """
-    def __init__(self, original_layer_name: str, part_index: int, worker_node: 'WorkerNode', runtime_record: RuntimeRecord):
-        super(PartialConv2dProxy, self).__init__()
-        self.original_layer_name = original_layer_name
-        self.part_index = part_index
-        self.worker_node = worker_node
-        self.runtime_record = runtime_record
-        self.local_computation = runtime_record.create_subcategory('local computation')
-        self.network_overhead = runtime_record.create_subcategory('network overhead')
-
-    def forward(self, x: torch.Tensor):
-        start = time.time()
-        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
-        runtime, result = self.worker_node.receive_inference_result()
-        end = time.time()
-        self.record_runtime(total_runtime=end - start, local_computation_runtime=runtime)
-        return result
-
-    def request_inference(self, x: torch.Tensor):
-        self.request_start_time = time.time()
-        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
-
-    def receive_inference_result(self):
-        runtime, result = self.worker_node.receive_inference_result()
-        request_end_time = time.time()
-        self.record_runtime(total_runtime=request_end_time - self.request_start_time, local_computation_runtime=runtime)
-        return result
-
-    def record_runtime(self, total_runtime: float, local_computation_runtime: float):
-        self.runtime_record.total_runtime = total_runtime
-        self.local_computation.total_runtime = local_computation_runtime
-        self.network_overhead.total_runtime = total_runtime - local_computation_runtime
+from typing import Callable
 
 
 class SplitConv2d(torch.nn.Module):
@@ -94,7 +55,85 @@ class SplitConv2d(torch.nn.Module):
         # x는 4차원 batch형태로 주어지기 때문에 dim=1이 출력 채널을 의미함.
         # 즉, 쪼개진 conv들이 각각 계산한 출력 채널을 차곡차곡 포갠 것을 최종 출력으로 사용하는 것.
         return torch.cat([conv(x) for conv in self.partial_convs], dim=1)
- 
+
+class PartialConv2d(torch.nn.Module):
+    def __init__(self, conv: torch.nn.Conv2d, out_channel_begin: int, out_channel_end: int):
+        """
+        :param conv: 원본 레이어
+
+        .. note::
+        생성된 분할 레이어는 원본 출력 채널의 [out_channel_begin, out_channel_end) 구간을 담당한다.  
+        ex) PartialConv2d(conv, 4, 10) => 5 ~ 10번째 출력 채널을 담당 (i.e., conv.weight[4:10])
+        """
+        super(PartialConv2d, self).__init__()
+        # 출력 채널의 일정 범위만 담당하는 작은 conv 레이어 만들기
+        out_channels = out_channel_end - out_channel_begin
+        self.conv = torch.nn.Conv2d(conv.in_channels, out_channels, conv.kernel_size, conv.stride, conv.padding, bias = conv.bias is not None)
+
+        # 원본 레이어의 가중치 복사해서 넣기 (bias는 없는 경우도 있음)
+        self.conv.weight.data = conv.weight[out_channel_begin:out_channel_end]
+        if conv.bias is not None:
+            self.conv.bias.data = conv.bias[out_channel_begin:out_channel_end]
+
+    def forward(self, x: torch.Tensor):
+        return self.conv(x)
+
+
+class WorkerNode:
+    """
+    마스터 노드에서 각 워커 노드와 통신을 담당하는 클래스
+    """
+    def __init__(self, host: str, port: int):
+        print(f"Attempting to connect to {host}:{port}...")
+        self.sock = tcp.connect_server(host, port)
+        print(f"Successfully connected to {host}:{port}")
+
+    #어디서부터 어디까지 계산할지 보내는 부분 추가
+    def request_inference(self, x: torch.Tensor, original_layer_name: str, part_index: int):
+        tcp.send_utf8(self.sock, original_layer_name)
+        tcp.send_u32(self.sock, part_index)
+        tcp.send_tensor(self.sock, x)
+
+    def receive_inference_result(self):
+        return tcp.recv_f64(self.sock), tcp.recv_tensor(self.sock)
+
+
+class PartialConv2dProxy(torch.nn.Module):
+    """
+    WorkerNode를 통해 연산을 처리하는 PartialConv2d의 프록시
+    """
+    def __init__(self, original_layer_name: str, part_index: int, worker_node: 'WorkerNode', runtime_record: RuntimeRecord):
+        super(PartialConv2dProxy, self).__init__()
+        self.original_layer_name = original_layer_name
+        self.part_index = part_index
+        self.worker_node = worker_node
+        self.runtime_record = runtime_record
+        self.local_computation = runtime_record.create_subcategory('local computation')
+        self.network_overhead = runtime_record.create_subcategory('network overhead')
+
+    def forward(self, x: torch.Tensor):
+        start = time.time()
+        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+        runtime, result = self.worker_node.receive_inference_result()
+        end = time.time()
+        self.record_runtime(total_runtime=end - start, local_computation_runtime=runtime)
+        return result
+
+    def request_inference(self, x: torch.Tensor):
+        self.request_start_time = time.time()
+        self.worker_node.request_inference(x, self.original_layer_name, self.part_index)
+
+    def receive_inference_result(self):
+        runtime, result = self.worker_node.receive_inference_result()
+        request_end_time = time.time()
+        self.record_runtime(total_runtime=request_end_time - self.request_start_time, local_computation_runtime=runtime)
+        return result
+
+    def record_runtime(self, total_runtime: float, local_computation_runtime: float):
+        self.runtime_record.total_runtime = total_runtime
+        self.local_computation.total_runtime = local_computation_runtime
+        self.network_overhead.total_runtime = total_runtime - local_computation_runtime
+
 
 class SplitResnet(torch.nn.Module):
     """
@@ -220,3 +259,111 @@ def rgetattr(obj, attr, *args):
         return getattr(obj, attr, *args)
     return functools.reduce(_getattr, [obj] + attr.split('.'))
 
+
+
+def measure_distributed_resnet_overheads(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    progress = tqdm(total = 2, desc = 'initializing distributed models', file = sys.stdout, leave = False)
+
+    progress.set_postfix_str('sequential version')
+    distributed_sequential = DistributedResnet(split, worker_nodes, is_sequential = True)
+    progress.update()
+
+    progress.set_postfix_str('parallel version')
+    distributed_parallel = DistributedResnet(split, worker_nodes, is_sequential = False)
+    progress.update()
+    progress.close()
+
+
+    # 네트워크 오버헤드 분석
+    input_shape = [1, 3, 256, 256]
+
+    progress = tqdm(total = 2, desc = 'measuring distributed model overhead', file = sys.stdout, position = 0, leave = False)
+    progress.set_postfix_str('running sequential version')
+    distributed_sequential.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = progress)
+
+    progress.set_postfix_str('running parallel version')
+    distributed_parallel.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = progress)
+    progress.close()
+
+    print(f"sequential version distributed part total runtime: {distributed_sequential.runtime_record.net_runtime_per_category('partial convs'):.7f}")
+    for i in range(len(worker_nodes)):
+        print(f"worker node {i} total runtime: {distributed_sequential.runtime_record.net_runtime_per_category(f'worker {i}'):.7f}")
+
+    print(f"parallel version distributed part total runtime: {distributed_parallel.runtime_record.net_runtime_per_category('partial convs'):.7f}")
+    for i in range(len(worker_nodes)):
+        print(f"worker node {i} total runtime: {distributed_parallel.runtime_record.net_runtime_per_category(f'worker {i}'):.7f}")
+
+def test_worker_node_server(port: int, split: SplitResnet):
+    try:
+        with tcp.create_server('localhost', port) as server:
+            client_sock, client_addr = server.accept()
+
+            while True:
+                original_layer_name = tcp.recv_utf8(client_sock)
+                if original_layer_name == 'terminate':
+                    break
+                
+                part_index = tcp.recv_u32(client_sock)
+                x = tcp.recv_tensor(client_sock)
+                with torch.no_grad():
+                    start = time.time()
+                    y = split.split_conv_dict[original_layer_name].partial_convs[part_index](x)
+                    end = time.time()
+
+                    # 네트워크 딜레이 재현
+                    # time.sleep(0.02)
+                    
+                    tcp.send_f64(client_sock, end - start)
+                    tcp.send_tensor(client_sock, y)
+
+            client_sock.close()
+    except:
+        print('[Exception from worker node]')
+        tcp.traceback.print_exc()
+
+
+#원래 함수랑 달리 수정함 마스터노드에서 보내는걸로
+def run_test_on_distributed_env(num_workers: int, test: Callable[[List[WorkerNode], models.ResNet, SplitResnet], None], port_offset: int = 1001, use_pretrained_resnet=False):
+    tcp.supress_immutable_tensor_warning()
+
+    progress = tqdm(total=2, desc='initializing worker node model', file=sys.stdout, leave=False)
+    orig = models.resnet50(pretrained=use_pretrained_resnet)
+    progress.update()
+    split = SplitResnet(orig, num_workers)
+    progress.update()
+
+    try:
+        worker_nodes = [WorkerNode(f'worker_node_{i + 1}', port_offset + i) for i in tqdm(range(num_workers), desc='connecting to worker nodes', file=sys.stdout, leave=False)]
+
+        test(worker_nodes, orig, split)
+
+        # 모든 worker node 종료
+        for worker_node in worker_nodes:
+            tcp.send_utf8(worker_node.sock, 'terminate')
+    except Exception as e:
+        print(f'[Exception from main server]: {e}')
+        tcp.traceback.print_exc()
+
+def test_master_worker_communication(worker_nodes: List[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    """
+    마스터와 워커 노드 간의 기본 통신을 테스트하기 위한 함수
+    각 워커 노드로 데이터를 보내고, 올바른 결과를 받는지 확인
+    """
+    print("\nStarting Master-Worker Communication Test...\n")
+
+    # 임의의 데이터 생성
+    x = torch.randn((1, 3, 224, 224))
+
+    for worker_node in worker_nodes:
+        try:
+            worker_node.request_inference(x, "conv1", 0)  # conv1에서 첫 번째 부분 계산 요청
+            runtime, result = worker_node.receive_inference_result()
+
+            # 테스트 결과 출력
+            print(f"Received result from worker node: Runtime = {runtime:.4f} sec, Result Shape = {result.shape}")
+        except Exception as e:
+            print(f"Error during communication with worker node: {e}")
+
+
+if __name__ == '__main__':
+    run_test_on_distributed_env(num_workers=2, test=test_master_worker_communication)

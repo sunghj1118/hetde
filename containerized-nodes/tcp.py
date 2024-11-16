@@ -82,7 +82,7 @@ def recv_tensor(sock: socket, print_time: bool = False) -> torch.Tensor:
     tensor_size = recv_u32(sock)
     raw_bytes = sock.recv(tensor_size, MSG_WAITALL)
     t3 = time.time()
-    result = torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(shape)
+    result = torch.frombuffer(raw_bytes, dtype = torch.float32).reshape(shape).clone() #The given buffer is not writable하다고 해서 잠깐 수정
     t4 = time.time()
 
     if print_time:

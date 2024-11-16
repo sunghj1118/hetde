@@ -1,13 +1,13 @@
-# Master Node Dockerfile (Dockerfile.master)
-
-# Use PyTorch official image as base
 FROM pytorch/pytorch
 
-# Install necessary packages
-RUN pip install Flask tqdm
-RUN apt-get update && apt-get -y install net-tools git
 
-# ImageNet1K 테스트 데이터
+RUN apt-get update && apt-get install -y git
+
+
+RUN pip install Flask tqdm
+RUN apt-get update && apt-get -y install net-tools
+
+# Clone ImageNet1K test data
 RUN git clone https://github.com/EliSchwartz/imagenet-sample-images.git
 RUN git clone https://gist.github.com/942d3a0ac09ec9e5eb3a.git
 
@@ -15,8 +15,6 @@ RUN git clone https://gist.github.com/942d3a0ac09ec9e5eb3a.git
 COPY master.py master.py
 COPY runtime.py runtime.py
 COPY tcp.py tcp.py
-COPY worker.py worker.py  
-COPY testgwan.py testgwan.py
 
-# Run the master node and then test script
-CMD ["sh", "-c", "python master.py & sleep 30 && python testgwan.py"]
+
+CMD ["sh", "-c", "sleep 30 && python master.py"]
