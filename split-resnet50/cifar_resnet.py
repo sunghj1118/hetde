@@ -87,7 +87,7 @@ def test_model(model: torch.nn.Module, test_dataloader: DataLoader, device: str 
     # Note: len(test_dataloader)는 데이터가 아니라 batch가 몇개나 있는지 반환함
     num_tests = len(test_dataloader.dataset)
 
-    model.to(device).eval()
+    model.eval()
     with torch.no_grad():
         num_corrects = 0
         for batch, (x, y) in enumerate(tqdm(test_dataloader)):
@@ -109,7 +109,7 @@ def train_model(model: torch.nn.Module, train_dataloader: DataLoader, loss_fn: t
 
     net_loss = 0
     
-    model.to(device).train()
+    model.train()
     for batch, (x, y) in enumerate(tqdm(train_dataloader)):
         x, y = x.to(device), y.to(device)
         pred = model(x)
@@ -144,6 +144,8 @@ if __name__ == '__main__':
         model = models.resnet50()
         model.fc = torch.nn.Linear(model.fc.in_features, 10)
         model.load_state_dict(torch.load(weight_path, weights_only = True))
+        model.to(device)
+
         num_corrects, num_tests = test_model(model, test_dataloader, device)
         print(f'accuracy of saved model: {num_corrects / num_tests * 100}%')
 
@@ -152,6 +154,7 @@ if __name__ == '__main__':
         # cifar10에 사용하려면 마지막 classifier를 출력 차원이 10인 새로운 레이어로 교체해야 함
         model = models.resnet50(pretrained = True)
         model.fc = torch.nn.Linear(model.fc.in_features, 10)
+        model.to(device)
 
         # 학습하기 전 정확도 확인
         num_corrects, num_tests = test_model(model, test_dataloader, device)
