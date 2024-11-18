@@ -3,8 +3,9 @@
 # - https://github.com/kuangliu/pytorch-cifar/blob/master/main.py
 # 실행 명령:
 # 일단 빌드) docker build -t test .
-# 학습) docker run --rm --gpus=all -it -v savevolume:/save test python cifar_resnet.py --mode test
-# 추론) docker run --rm --gpus=all -it -v savevolume:/save test python cifar_resnet.py --mode train --epoch 1
+# 새롭게 학습) docker run --rm --gpus=all -it -v savevolume:/save test python cifar_resnet.py --mode train --epoch 20
+# 이어서 학습) docker run --rm --gpus=all -it -v savevolume:/save test python cifar_resnet.py --mode train --epoch 20 --resume True
+# 추론) docker run --rm --gpus=all -it -v savevolume:/save test python cifar_resnet.py --mode test
 import torch
 from torch.utils.data import DataLoader
 
@@ -89,7 +90,7 @@ def test_model(model: torch.nn.Module, test_dataloader: DataLoader, device: str 
             pred_labels = torch.argmax(pred, dim=1)
             
             num_corrects += torch.sum(pred_labels == y).item()
-    return num_corrects, num_tests
+    return num_corrects / num_tests
 
 
 """
@@ -98,20 +99,26 @@ train_dataloader의 모든 데이터에 대해 한 epoch 학습하고 net loss�
 def train_model(model: torch.nn.Module, train_dataloader: DataLoader, loss_fn: torch.nn.Module, optimizer: torch.optim.Optimizer, device: str = 'cpu'):
     assert(device in ('cpu', 'cuda'))
 
+
     net_loss = 0
+    num_tests = len(train_dataloader.dataset)
+    num_corrects = 0
     
     model.train()
     for batch, (x, y) in enumerate(tqdm(train_dataloader)):
         x, y = x.to(device), y.to(device)
         pred = model(x)
         loss = loss_fn(pred, y)
+
+        pred_labels = torch.argmax(pred, dim=1)
+        num_corrects += torch.sum(pred_labels == y).item()
         net_loss += loss.item()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    return net_loss
+    return net_loss, num_corrects / num_tests
 
 
 if __name__ == '__main__':
@@ -119,6 +126,7 @@ if __name__ == '__main__':
     args.add_argument("--savepath", type=str, default='/save') # 학습될 weight를 저장할 위치 (컨테이너 실행할 때 주어진 볼륨 옵션 -v [볼륨 이름]:[경로]의 경로와 일치해야 함)
     args.add_argument("--mode", type=str, default='train')
     args.add_argument("--epoch", type=int, default=1)
+    args.add_argument("--resume", type=bool, default=False)
     args = args.parse_args()
     
     weight_path = args.savepath + '/trained_weight.pth'
@@ -137,19 +145,24 @@ if __name__ == '__main__':
         model.load_state_dict(torch.load(weight_path, weights_only = True))
         model.to(device)
 
-        num_corrects, num_tests = test_model(model, test_dataloader, device)
-        print(f'accuracy of saved model: {num_corrects / num_tests * 100}%')
+        accuracy = test_model(model, test_dataloader, device)
+        print(f'accuracy of saved model: {accuracy * 100}%')
 
     elif args.mode == 'train':
         # 원본은 클래스가 1000개인 imagenet에 대해 학습되었으므로
         # cifar10에 사용하려면 마지막 classifier를 출력 차원이 10인 새로운 레이어로 교체해야 함
         model = models.resnet50(pretrained = True)
         model.fc = torch.nn.Linear(model.fc.in_features, 10)
+
+        # 마지막 상태로부터 학습 재개
+        if args.resume:
+            model.load_state_dict(torch.load(weight_path, weights_only = True))
+
         model.to(device)
 
         # 학습하기 전 정확도 확인
-        num_corrects, num_tests = test_model(model, test_dataloader, device)
-        print(f'accuracy before training: {num_corrects / num_tests * 100}%')
+        accuracy = test_model(model, test_dataloader, device)
+        print(f'accuracy before training: {accuracy * 100}%')
 
         # cifar10에 대해 새롭게 학습
         learning_rate = 0.01
@@ -158,12 +171,10 @@ if __name__ == '__main__':
         loss_fn = torch.nn.CrossEntropyLoss()
 
         for epoch in range(args.epoch):
-            net_loss = train_model(model, train_dataloader, loss_fn, optimizer, device)
-            print(f'epoch#{epoch} net loss: {net_loss}')
+            net_loss, train_accuracy = train_model(model, train_dataloader, loss_fn, optimizer, device)
+            test_accuracy = test_model(model, test_dataloader, device)
 
-            # 학습한 뒤의 정확도 확인
-            num_corrects, num_tests = test_model(model, test_dataloader, device)
-            print(f'accuracy after training: {num_corrects / num_tests * 100}%')
+            print(f'epoch#{epoch} net loss: {net_loss}, train accuracy: {train_accuracy * 100}%, test accuracy: {test_accuracy * 100}%')
 
             # 모델 저장
             torch.save(model.state_dict(), weight_path)
