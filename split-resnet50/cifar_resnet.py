@@ -161,8 +161,8 @@ if __name__ == '__main__':
         model.to(device)
 
         # 학습하기 전 정확도 확인
-        accuracy = test_model(model, test_dataloader, device)
-        print(f'accuracy before training: {accuracy * 100}%')
+        best_accuracy = test_model(model, test_dataloader, device)
+        print(f'accuracy before training: {best_accuracy * 100}%')
 
         # cifar10에 대해 새롭게 학습
         learning_rate = 0.01
@@ -176,6 +176,9 @@ if __name__ == '__main__':
 
             print(f'epoch#{epoch} net loss: {net_loss}, train accuracy: {train_accuracy * 100}%, test accuracy: {test_accuracy * 100}%')
 
-            # 모델 저장
-            torch.save(model.state_dict(), weight_path)
+            # 테스트 데이터 정확도가 제일 높게 나오는 모델 저장
+            if test_accuracy > best_accuracy:
+                print(f'new best test accuracy! saving the model\'s weight to {weight_path}')
+                best_accuracy = test_accuracy
+                torch.save(model.state_dict(), weight_path)
             
