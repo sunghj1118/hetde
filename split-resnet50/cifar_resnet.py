@@ -1,4 +1,6 @@
-# 참고자료: https://medium.com/@thatchawin.ler/cifar10-with-resnet-in-pytorch-a86fe18049df
+# 참고자료:
+# - https://medium.com/@thatchawin.ler/cifar10-with-resnet-in-pytorch-a86fe18049df
+# - https://github.com/kuangliu/pytorch-cifar/blob/master/main.py
 # 실행 명령:
 # 일단 빌드) docker build -t test .
 # 학습) docker run --rm --gpus=all -it -v savevolume:/save test python cifar_resnet.py --mode test
@@ -14,27 +16,16 @@ import os
 import argparse
 from tqdm import tqdm
 
-mean, std = [0.4914, 0.4822, 0.4465], [0.247, 0.243, 0.261]
-
 train_data_transform = transforms.Compose([
-    # Flip the images randomly on the horizontal
-    transforms.RandomHorizontalFlip(p=0.5),
-    # Randomly rotate some images by 20 degrees
-    transforms.RandomRotation(20),
-    # Randomly adjust color jitter of the images
-    transforms.ColorJitter(brightness = 0.1,contrast = 0.1,saturation = 0.1),
-    # Randomly adjust sharpness
-    transforms.RandomAdjustSharpness(sharpness_factor = 2,p = 0.2),
-    # Turn the image into a torch.Tensor
-    transforms.ToTensor() ,
-    #randomly erase a pixel
-    transforms.Normalize(mean, std),
-    transforms.RandomErasing(p=0.75,scale=(0.02, 0.1),value=1.0, inplace=False)
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
 test_data_transform = transforms.Compose([  
     transforms.ToTensor(),
-    transforms.Normalize(mean, std),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
 
@@ -137,7 +128,7 @@ if __name__ == '__main__':
     print(f'currently using {device} to run model')
 
     # cifar10 데이터 불러오기
-    train_dataloader, test_dataloader = prepare_cifar10_dataloader(batch_size = 100, num_workers = os.cpu_count())
+    train_dataloader, test_dataloader = prepare_cifar10_dataloader(batch_size = 128, num_workers = os.cpu_count())
 
     if args.mode == 'test':
         # 학습된 모델을 불러와 정확도 확인 (저장 전과 동일한지 확인 필요)
@@ -169,10 +160,11 @@ if __name__ == '__main__':
         for epoch in range(args.epoch):
             net_loss = train_model(model, train_dataloader, loss_fn, optimizer, device)
             print(f'epoch#{epoch} net loss: {net_loss}')
-            
-        # 학습이 끝난 상태의 정확도 확인
-        num_corrects, num_tests = test_model(model, test_dataloader, device)
-        print(f'accuracy after training: {num_corrects / num_tests * 100}%')
 
-        # 모델 저장
-        torch.save(model.state_dict(), weight_path)
+            # 학습한 뒤의 정확도 확인
+            num_corrects, num_tests = test_model(model, test_dataloader, device)
+            print(f'accuracy after training: {num_corrects / num_tests * 100}%')
+
+            # 모델 저장
+            torch.save(model.state_dict(), weight_path)
+            
