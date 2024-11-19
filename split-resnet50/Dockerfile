@@ -43,8 +43,7 @@ EXPOSE 29500
 # 주의사항: 이건 로그로 결과 확인해야해서 --rm 옵션 안 들어있음!!! 끝나면 종료된 컨테이너 직접 삭제할 것
 
 # rpc_resnet.py 테스트하는 방법:
-# 1. docker run -dt -p 29500:29500 test python rpc_resnet.py --rank 0
-# 2. docker run -dt test python rpc_resnet.py --rank 1; docker run -dt test python rpc_resnet.py --rank 2; docker run -dt test python rpc_resnet.py --rank 3
+# docker run -dt -p 29500:29500 test python rpc_resnet.py --rank 0; docker run -dt test python rpc_resnet.py --rank 1; docker run -dt test python rpc_resnet.py --rank 2; docker run -dt test python rpc_resnet.py --rank 3
 #
 # rank 0인 컨테이너가 마스터 서버, rank 1 ~ 3은 워커 노드 역할임
 #

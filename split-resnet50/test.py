@@ -41,7 +41,11 @@ class SplitConv2d(torch.nn.Module):
 
         # input channel 방향 pruning 여부 기록
         # Note: weight 차원은 [output, input, height, width] 순서
-        self.is_input_channel_pruned = (torch.sum(conv.weight, dim = [0, 2, 3]) == 0).tolist()
+        self.is_input_channel_unpruned = (torch.sum(conv.weight, dim = [0, 2, 3]) != 0).tolist()
+
+        # 나중에 prune된 채널 빼고 입력 데이터가 왔을 때 원래 shape로 복원할 수 있도록 변수를 준비해둠
+        # 0으로 가득 찬 텐서에 unpruned input만 제자리에 끼워넣고 그걸 입력 데이터로 사용하는 방식
+        self.restored_x = None
 
         # 사전 조건:
         # - 총 파트 수는 2 이상
@@ -177,10 +181,15 @@ class DistributedConv2d(torch.nn.Module):
     PartialConv2d를 직접 계산하는 대신 대응되는 worker node에
     요청을 보내는 PartialConv2dProxy를 사용한다.
     """
-    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], is_sequential: bool, runtime_record: RuntimeRecord):
+    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], is_sequential: bool, is_input_channel_unpruned: list[bool], runtime_record: RuntimeRecord):
         super(DistributedConv2d, self).__init__()
 
         self.is_sequential = is_sequential
+
+        # 각 입력 채널이 pruning된 상태인지 기억해둠.
+        # 나중에 워커 노드로 요청을 보낼 때 True인 채널만 전송됨.
+        self.is_input_channel_unpruned = is_input_channel_unpruned
+
         self.partial_convs = torch.nn.ModuleList()
         self.runtime_record = runtime_record
         self.partial_convs_runtime = runtime_record.create_subcategory('partial convs')
@@ -191,6 +200,9 @@ class DistributedConv2d(torch.nn.Module):
     
     def forward(self, x: torch.Tensor):
         start = time.time()
+
+        # prune되지 않은 입력 채널만 골라서 사용
+        x = x[:, self.is_input_channel_unpruned, :, :]
 
         # 연결된 워커 노드에 부분적인 inference를 요청
         if self.is_sequential:
@@ -306,7 +318,7 @@ class DistributedResnet(torch.nn.Module):
                              f"Required: {num_splits}, Available: {len(self.worker_nodes)}")
         
         return DistributedConv2d(name, self.worker_nodes[:num_splits], is_sequential,
-                                 self.runtime_record.create_subcategory(name))
+                                 layer.is_input_channel_unpruned, self.runtime_record.create_subcategory(name))
 
     def forward(self, x: torch.Tensor):
         start = time.time()
