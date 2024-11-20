@@ -260,39 +260,6 @@ def rgetattr(obj, attr, *args):
     return functools.reduce(_getattr, [obj] + attr.split('.'))
 
 
-
-def measure_distributed_resnet_overheads(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
-    progress = tqdm(total = 2, desc = 'initializing distributed models', file = sys.stdout, leave = False)
-
-    progress.set_postfix_str('sequential version')
-    distributed_sequential = DistributedResnet(split, worker_nodes, is_sequential = True)
-    progress.update()
-
-    progress.set_postfix_str('parallel version')
-    distributed_parallel = DistributedResnet(split, worker_nodes, is_sequential = False)
-    progress.update()
-    progress.close()
-
-
-    # 네트워크 오버헤드 분석
-    input_shape = [1, 3, 256, 256]
-
-    progress = tqdm(total = 2, desc = 'measuring distributed model overhead', file = sys.stdout, position = 0, leave = False)
-    progress.set_postfix_str('running sequential version')
-    distributed_sequential.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = progress)
-
-    progress.set_postfix_str('running parallel version')
-    distributed_parallel.analyze_overheads(input_shape, num_tests = 5, outer_tqdm_progress = progress)
-    progress.close()
-
-    print(f"sequential version distributed part total runtime: {distributed_sequential.runtime_record.net_runtime_per_category('partial convs'):.7f}")
-    for i in range(len(worker_nodes)):
-        print(f"worker node {i} total runtime: {distributed_sequential.runtime_record.net_runtime_per_category(f'worker {i}'):.7f}")
-
-    print(f"parallel version distributed part total runtime: {distributed_parallel.runtime_record.net_runtime_per_category('partial convs'):.7f}")
-    for i in range(len(worker_nodes)):
-        print(f"worker node {i} total runtime: {distributed_parallel.runtime_record.net_runtime_per_category(f'worker {i}'):.7f}")
-
 def test_worker_node_server(port: int, split: SplitResnet):
     try:
         with tcp.create_server('localhost', port) as server:
@@ -332,9 +299,35 @@ def run_test_on_distributed_env(num_workers: int, test: Callable[[List[WorkerNod
     split = SplitResnet(orig, num_workers)
     progress.update()
 
-    try:
-        worker_nodes = [WorkerNode(f'worker_node_{i + 1}', port_offset + i) for i in tqdm(range(num_workers), desc='connecting to worker nodes', file=sys.stdout, leave=False)]
+    # 워커 노드 연결
+    worker_nodes = []
+    max_retries = 2  # 재시도 최대 횟수
+    retry_delay = 5  # 각 재시도 사이의 대기 시간
 
+    for i in tqdm(range(num_workers), desc='connecting to worker nodes', file=sys.stdout, leave=False):
+        host = f'worker_node_{i + 1}'
+        port = port_offset + i
+        connected = False
+
+        for attempt in range(max_retries):
+            try:
+                print(f"Attempting to connect to {host}:{port} (Attempt {attempt + 1}/{max_retries})...")
+                worker_node = WorkerNode(host, port)
+                worker_nodes.append(worker_node)
+                connected = True
+                break
+            except Exception as e:
+                print(f"Connection failed: {e}")
+                time.sleep(retry_delay)
+
+        if not connected:
+            print(f"Failed to connect to worker node {host}:{port} after {max_retries} attempts. Exiting.")
+            return
+
+    print("모든 워커 노드에 성공적으로 연결되었습니다.")
+    progress.update()
+
+    try:
         test(worker_nodes, orig, split)
 
         # 모든 worker node 종료
@@ -356,13 +349,17 @@ def test_master_worker_communication(worker_nodes: List[WorkerNode], orig: model
 
     for worker_node in worker_nodes:
         try:
+            print("통과 2")
             worker_node.request_inference(x, "conv1", 0)  # conv1에서 첫 번째 부분 계산 요청
+            print ("통과3")
             runtime, result = worker_node.receive_inference_result()
 
             # 테스트 결과 출력
             print(f"Received result from worker node: Runtime = {runtime:.4f} sec, Result Shape = {result.shape}")
         except Exception as e:
             print(f"Error during communication with worker node: {e}")
+
+
 
 
 if __name__ == '__main__':
