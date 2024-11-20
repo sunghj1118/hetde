@@ -1,0 +1,20 @@
+FROM pytorch/pytorch
+
+
+RUN apt-get update && apt-get install -y git
+
+
+RUN pip install Flask tqdm
+RUN apt-get update && apt-get -y install net-tools
+
+# Clone ImageNet1K test data
+RUN git clone https://github.com/EliSchwartz/imagenet-sample-images.git
+RUN git clone https://gist.github.com/942d3a0ac09ec9e5eb3a.git
+
+# Copy Python files to the container
+COPY master.py master.py
+COPY runtime.py runtime.py
+COPY tcp.py tcp.py
+
+
+CMD ["sh", "-c", "sleep 30 && python master.py"]
