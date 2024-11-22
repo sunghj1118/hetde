@@ -304,24 +304,25 @@ def run_test_on_distributed_env(num_workers: int, test: Callable[[List[WorkerNod
     max_retries = 2  # 재시도 최대 횟수
     retry_delay = 5  # 각 재시도 사이의 대기 시간
 
-    for i in tqdm(range(num_workers), desc='connecting to worker nodes', file=sys.stdout, leave=False):
+    for i in range(num_workers):
         host = f'worker_node_{i + 1}'
         port = port_offset + i
         connected = False
 
         for attempt in range(max_retries):
             try:
-                print(f"Attempting to connect to {host}:{port} (Attempt {attempt + 1}/{max_retries})...")
+                tqdm.write(f"Attempting to connect to {host}:{port} (Attempt {attempt + 1}/{max_retries})...")
                 worker_node = WorkerNode(host, port)
                 worker_nodes.append(worker_node)
                 connected = True
+                tqdm.write(f"Successfully connected to {host}:{port}.")
                 break
             except Exception as e:
-                print(f"Connection failed: {e}")
+                tqdm.write(f"Connection failed: {e}. Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
 
         if not connected:
-            print(f"Failed to connect to worker node {host}:{port} after {max_retries} attempts. Exiting.")
+            tqdm.write(f"Failed to connect to worker node {host}:{port} after {max_retries} attempts. Exiting.")
             return
 
     print("모든 워커 노드에 성공적으로 연결되었습니다.")
@@ -349,9 +350,7 @@ def test_master_worker_communication(worker_nodes: List[WorkerNode], orig: model
 
     for worker_node in worker_nodes:
         try:
-            print("통과 2")
             worker_node.request_inference(x, "conv1", 0)  # conv1에서 첫 번째 부분 계산 요청
-            print ("통과3")
             runtime, result = worker_node.receive_inference_result()
 
             # 테스트 결과 출력
@@ -360,7 +359,210 @@ def test_master_worker_communication(worker_nodes: List[WorkerNode], orig: model
             print(f"Error during communication with worker node: {e}")
 
 
+#여기서부터 이미지 latency test
+import time
+import os
+from tqdm import tqdm
+from PIL import Image
+import torchvision.transforms as transforms
 
+image_repo_path = "imagenet-sample-images"
+class_mapping_path = "942d3a0ac09ec9e5eb3a/imagenet1000_clsidx_to_labels.txt"
+
+def load_class_mapping(mapping_path):
+    with open(mapping_path, 'r') as f:
+        class_mapping = eval(f.read())
+    return class_mapping
+
+def load_image(image_path):
+    img = Image.open(image_path).convert('RGB')
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(256),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    img_tensor = preprocess(img).unsqueeze(0)
+    return img_tensor
+
+
+# ImageNet1K 테스트 데이터 불러오기 (클래스마다 이미지 1개)
+class_mapping = load_class_mapping(class_mapping_path)
+assert(len(class_mapping) == 1000)
+
+image_files = [os.path.join(image_repo_path, f) for f in os.listdir(image_repo_path) if f.endswith('.JPEG')]
+assert(len(image_files) == 1000)
+
+# 1000개 다 돌리니까 너무 오래걸려서 앞부분만 테스트
+image_files = image_files[:20]
+
+
+def calculate_latency(model: torch.nn.Module, image_files: list[str]):
+    latencies = []
+    model.eval()
+
+    with torch.no_grad():
+        progress_bar = tqdm(total=len(image_files), desc="Calculating latency", file=sys.stdout, position=1, leave=False)
+
+        for image_file in image_files:
+            input_tensor = load_image(image_file)
+
+            # 측정 시작
+            start_time = time.time()
+            outputs = model(input_tensor)
+            # 측정 종료
+            end_time = time.time()
+            latency = end_time - start_time
+            latencies.append(latency)
+
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+    average_latency = sum(latencies) / len(latencies) if latencies else 0
+    return average_latency
+
+
+def test_image_latency(worker_nodes: List[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    """
+    분산 ResNet 모델로 이미지의 추론 지연 시간을 측정합니다.
+    """
+    print("\nStarting Image Latency Test...\n")
+    distributed_resnet = DistributedResnet(split, worker_nodes, is_sequential=False)
+    avg_latency = calculate_latency(distributed_resnet, image_files)
+    print(f"\nAverage Latency for {len(image_files)} images: {avg_latency:.4f} seconds")
+
+def measure_distributed_resnet_accuracy_and_latency(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    progress = tqdm(total = 2, desc = 'measuring distributed model accuracy and latency', file = sys.stdout, position = 0)
+
+
+    # Distributed ResNet의 정확도 및 latency 측정
+    progress.set_postfix_str('running distributed model')
+    distributed = DistributedResnet(split, worker_nodes, is_sequential = False)
+    distributed_latency = test_image_latency(distributed, image_files, class_mapping)
+    progress.update()
+    progress.close()
+
+    print(f"- Distributed ResNet Latency: {distributed_latency:.6f} seconds")
+
+#원래 있던 함수 
+def calculate_accuracy_and_latency(model: torch.nn.Module, image_files: list[str], class_mapping: dict):
+    correct = 0
+    total = 0
+    latencies = []
+    model.eval()
+
+    with torch.no_grad():
+        progress_bar = tqdm(total=len(image_files), desc="Calculating accuracy and latency", file = sys.stdout, position = 1, leave = False)
+
+        for image_file in image_files:
+            input_tensor = load_image(image_file)
+
+            start_time = time.time()
+            outputs = model(input_tensor)
+            end_time = time.time()
+            latency = end_time - start_time
+            latencies.append(latency)
+
+            # 파일 이름에서 WordNet ID와 실제 정답 클래스 추출
+            file_name = os.path.basename(image_file)  # 파일명 예: 'n01440764_tench.JPEG' 또는 'n01622779_great_grey_owl.JPEG'
+            true_label = '_'.join(file_name.split('_')[1:]).split('.')[0]  # 'tench' 또는 'great_grey_owl'
+            true_label = true_label.replace('_', ' ')
+
+            # 예측한 클래스 선택
+            _, predicted = torch.max(outputs, 1)
+            predicted_label = predicted.item()
+
+            # 예측한 클래스가 실제 클래스와 일치하는지 확인 (여기서는 정답 클래스 true_label과 비교)
+            if true_label in class_mapping[predicted_label]:
+                correct += 1
+
+            total += 1
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+
+    accuracy = 100 * correct / total
+    average_latency = sum(latencies) / len(latencies)
+
+    return accuracy, average_latency
+
+def measure_distributed_resnet_accuracy_and_latency(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
+    progress = tqdm(total = 1, desc = 'measuring distributed model accuracy and latency', file = sys.stdout, position = 0)
+
+
+    # Distributed ResNet의 정확도 및 latency 측정
+    progress.set_postfix_str('running distributed model')
+    distributed = DistributedResnet(split, worker_nodes, is_sequential = False)
+    distributed_accuracy, distributed_latency = calculate_accuracy_and_latency(distributed, image_files, class_mapping)
+    progress.update()
+    progress.close()
+
+    print(f"- Distributed ResNet Accuracy: {distributed_accuracy:.2f}%")
+    print(f"- Distributed ResNet Latency: {distributed_latency:.6f} seconds")
+
+#밑에 3개 한세트 랜덤으로 이미지 20개 생성후 마스터->워커->마스터 걸리는 시간 측정
+def generate_random_images(num_images: int, input_shape: List[int]) -> List[torch.Tensor]:
+    """
+    주어진 개수와 크기로 랜덤 이미지를 생성합니다.
+    :param num_images: 생성할 랜덤 이미지 개수
+    :param input_shape: 각 이미지의 입력 크기 (e.g., [1, 3, 256, 256])
+    :return: 랜덤 이미지 텐서 리스트
+    """
+    return [torch.rand(*input_shape) for _ in range(num_images)]
+
+
+def calculate_latency_random_images(model: torch.nn.Module, random_images: List[torch.Tensor]):
+    """
+    랜덤 이미지를 사용하여 latency를 측정합니다.
+    :param model: 분산 ResNet 모델
+    :param random_images: 랜덤 이미지 리스트
+    :return: 평균 latency
+    """
+    latencies = []
+    model.eval()
+
+    with torch.no_grad():
+        progress_bar = tqdm(total=len(random_images), desc="Calculating latency", file=sys.stdout, position=1, leave=False)
+
+        for input_tensor in random_images:
+            # 시작 시간 기록
+            start_time = time.time()
+            
+            # 모델 추론 수행
+            outputs = model(input_tensor)
+            
+            # 종료 시간 기록
+            end_time = time.time()
+            latencies.append(end_time - start_time)
+
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+    # 평균 latency 계산
+    average_latency = sum(latencies) / len(latencies) if latencies else 0
+    return average_latency
+
+
+def test_random_image_latency(worker_nodes: List['WorkerNode'], orig: models.ResNet, split: 'SplitResnet'):
+    """
+    분산 ResNet 모델로 랜덤 이미지의 latency를 측정합니다.
+    """
+    print("\nStarting Random Image Latency Test...\n")
+    distributed_resnet = DistributedResnet(split, worker_nodes, is_sequential=False)
+
+    # 랜덤 이미지 생성
+    num_images = 20
+    input_shape = [1, 3, 256, 256]
+    random_images = generate_random_images(num_images, input_shape)
+
+    # Latency 측정
+    avg_latency = calculate_latency_random_images(distributed_resnet, random_images)
+    print(f"\nAverage Latency for {num_images} random images: {avg_latency:.4f} seconds")
 
 if __name__ == '__main__':
-    run_test_on_distributed_env(num_workers=2, test=test_master_worker_communication)
+    #run_test_on_distributed_env(num_workers=2, test=test_master_worker_communication)
+    #run_test_on_distributed_env(num_workers=2, test=measure_distributed_resnet_accuracy_and_latency, port_offset=1001, use_pretrained_resnet=True)
+    run_test_on_distributed_env(num_workers=2, test=test_random_image_latency, port_offset=1001, use_pretrained_resnet=True)
