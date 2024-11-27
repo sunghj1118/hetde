@@ -3,6 +3,7 @@ from typing import List, Callable
 import torch
 import torchvision.models as models
 from runtime import RuntimeRecord
+from pruning_test import IWisePruningConv2DKernels, prune
 
 class PartialConv2d(torch.nn.Module):
     def __init__(self, conv: torch.nn.Conv2d, out_channel_begin: int, out_channel_end: int):
@@ -37,6 +38,14 @@ class SplitConv2d(torch.nn.Module):
         SplitConv2d(conv, [2, 3, 10]) => 출력 채널의 수가 각각 2, 3, 10인 세 개의 conv 레이어로 쪼개기
         """
         super(SplitConv2d, self).__init__()
+
+        # input channel 방향 pruning 여부 기록
+        # Note: weight 차원은 [output, input, height, width] 순서
+        self.is_input_channel_unpruned = (torch.sum(conv.weight, dim = [0, 2, 3]) != 0).tolist()
+
+        # 나중에 prune된 채널 빼고 입력 데이터가 왔을 때 원래 shape로 복원할 수 있도록 변수를 준비해둠
+        # 0으로 가득 찬 텐서에 unpruned input만 제자리에 끼워넣고 그걸 입력 데이터로 사용하는 방식
+        self.restored_x = None
 
         # 사전 조건:
         # - 총 파트 수는 2 이상
@@ -172,10 +181,15 @@ class DistributedConv2d(torch.nn.Module):
     PartialConv2d를 직접 계산하는 대신 대응되는 worker node에
     요청을 보내는 PartialConv2dProxy를 사용한다.
     """
-    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], is_sequential: bool, runtime_record: RuntimeRecord):
+    def __init__(self, original_layer_name: str, worker_nodes: list[WorkerNode], is_sequential: bool, is_input_channel_unpruned: list[bool], runtime_record: RuntimeRecord):
         super(DistributedConv2d, self).__init__()
 
         self.is_sequential = is_sequential
+
+        # 각 입력 채널이 pruning된 상태인지 기억해둠.
+        # 나중에 워커 노드로 요청을 보낼 때 True인 채널만 전송됨.
+        self.is_input_channel_unpruned = is_input_channel_unpruned
+
         self.partial_convs = torch.nn.ModuleList()
         self.runtime_record = runtime_record
         self.partial_convs_runtime = runtime_record.create_subcategory('partial convs')
@@ -186,6 +200,9 @@ class DistributedConv2d(torch.nn.Module):
     
     def forward(self, x: torch.Tensor):
         start = time.time()
+
+        # prune되지 않은 입력 채널만 골라서 사용
+        x = x[:, self.is_input_channel_unpruned, :, :]
 
         # 연결된 워커 노드에 부분적인 inference를 요청
         if self.is_sequential:
@@ -301,7 +318,7 @@ class DistributedResnet(torch.nn.Module):
                              f"Required: {num_splits}, Available: {len(self.worker_nodes)}")
         
         return DistributedConv2d(name, self.worker_nodes[:num_splits], is_sequential,
-                                 self.runtime_record.create_subcategory(name))
+                                 layer.is_input_channel_unpruned, self.runtime_record.create_subcategory(name))
 
     def forward(self, x: torch.Tensor):
         start = time.time()
@@ -377,10 +394,34 @@ def assert_split_resnet_correctness():
     split = SplitResnet(orig, 3)
     assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
 
-def test_worker_node_server(port: int, split: SplitResnet):
+    
+# 모든 convolution 레이어를 입력 채널 단위로 pruning
+# 단, 최초 입력 레이어에 해당되는 conv1은 입력 채널이 단 3개 뿐이라서 무조건 원본을 유지함.
+#
+# prune.remove()를 하지 않으면 모종의 이유로 deepcopy에 실패하길래 바로 해버렸음.
+# 따라서 이 함수를 거친 뒤에는 마스크가 남지 않기 때문에 재학습을 하면 안됨!
+# * 0으로 유지되어야 하는 파라미터가 학습 이후 업데이트되기 때문
+def prune_all_conv_layers(model: models.ResNet, prune_amount: float):
+    for name, module in model.named_modules():
+       if isinstance(module, torch.nn.Conv2d) and name != 'conv1':
+           IWisePruningConv2DKernels.apply(module, 'weight', amount = prune_amount)
+           prune.remove(module, 'weight')
+
+
+def assert_pruned_split_resnet_correctness(prune_amount: float = 0.4):
+    orig = models.resnet50()
+    prune_all_conv_layers(orig, prune_amount)
+
+    split = SplitResnet(orig, 3)
+    assert_model_equality(orig, split, input_shape = [1, 3, 256, 256], num_tests = 20)
+
+
+def test_worker_node_server(port: int, split: SplitResnet, host: str = 'localhost'):
     try:
         with tcp.create_server('localhost', port) as server:
+            print(f'server:{port} running')
             client_sock, client_addr = server.accept()
+            print(f'server:{port} accepted client')
 
             while True:
                 original_layer_name = tcp.recv_utf8(client_sock)
@@ -388,6 +429,8 @@ def test_worker_node_server(port: int, split: SplitResnet):
                     break
                 
                 part_index = tcp.recv_u32(client_sock)
+
+                # print(f"server:{port} received request - {original_layer_name}::{part_index}")
                 x = tcp.recv_tensor(client_sock)
                 with torch.no_grad():
                     start = time.time()
@@ -406,15 +449,22 @@ def test_worker_node_server(port: int, split: SplitResnet):
         tcp.traceback.print_exc()
 
 
-def run_test_on_distributed_env(num_workers: int, test: Callable[[list[WorkerNode], models.ResNet, SplitResnet], None], port_offset: int = 1000, use_pretrained_resnet = False):
+def run_test_on_distributed_env(num_workers: int, test: Callable[[list[WorkerNode], models.ResNet, SplitResnet], None], port_offset: int = 1000, use_pretrained_resnet = False, prune_amount: float | None = None):
     tcp.supress_immutable_tensor_warning()
 
     progress = tqdm(total = 2, desc = 'initializing worker node model', file = sys.stdout, leave = False)
+
+    # 기본 모델 생성 (pruning 옵션이 있는 경우 여기서 처리)
     orig = models.resnet50(pretrained = use_pretrained_resnet)
+    if prune_amount != None:
+        prune_all_conv_layers(orig, prune_amount)
     progress.update()
+
+    # 출력 채널 단위로 분할된 모델 생성
     split = SplitResnet(orig, num_workers)
     progress.update()
 
+    # 워커 노드 역할을 할 스레드 생성
     progress = tqdm(total = num_workers, desc = 'initializing worker nodes', file = sys.stdout, leave = False)
     workers = []
 
@@ -510,6 +560,17 @@ def load_image(image_path):
 
 
 
+# ImageNet1K 테스트 데이터 불러오기 (클래스마다 이미지 1개)
+class_mapping = load_class_mapping(class_mapping_path)
+assert(len(class_mapping) == 1000)
+
+image_files = [os.path.join(image_repo_path, f) for f in os.listdir(image_repo_path) if f.endswith('.JPEG')]
+assert(len(image_files) == 1000)
+
+# 1000개 다 돌리니까 너무 오래걸려서 앞부분만 테스트
+image_files = image_files[:20]
+
+
 def calculate_accuracy_and_latency(model: torch.nn.Module, image_files: list[str], class_mapping: dict):
     correct = 0
     total = 0
@@ -553,22 +614,17 @@ def calculate_accuracy_and_latency(model: torch.nn.Module, image_files: list[str
     return accuracy, average_latency
 
 
+def measure_pruned_split_resnet_accuracy(prune_amount: float):
+    orig = models.resnet50(pretrained = True)
+    prune_all_conv_layers(orig, prune_amount)
+
+    split = SplitResnet(orig, 3)
+    accuracy, latency = calculate_accuracy_and_latency(split, image_files, class_mapping)
+    print(f"- {prune_amount * 100}% Pruned Split ResNet Accuracy: {accuracy:.2f}%")
+
 
 def measure_distributed_resnet_accuracy_and_latency(worker_nodes: list[WorkerNode], orig: models.ResNet, split: SplitResnet):
-    progress = tqdm(total = 3, desc = 'measuring distributed model accuracy and latency', file = sys.stdout, position = 0)
-
-    # ImageNet1K 테스트 데이터 불러오기 (클래스마다 이미지 1개)
-    progress.set_postfix_str('loading test data')
-    class_mapping = load_class_mapping(class_mapping_path)
-    assert(len(class_mapping) == 1000)
-
-    image_files = [os.path.join(image_repo_path, f) for f in os.listdir(image_repo_path) if f.endswith('.JPEG')]
-    assert(len(image_files) == 1000)
-    progress.update()
-
-    # 1000개 다 돌리니까 너무 오래걸려서 앞부분만 테스트
-    image_files = image_files[:20]
-    
+    progress = tqdm(total = 2, desc = 'measuring distributed model accuracy and latency', file = sys.stdout, position = 0)
 
     # 원본 ResNet의 정확도 및 latency 측정
     progress.set_postfix_str('running original model')
@@ -595,9 +651,14 @@ if __name__ == '__main__':
     # tcp.assert_tcp_communication()
     # assert_split_conv_correctness()
     # assert_split_resnet_correctness()
+    # assert_pruned_split_resnet_correctness()
+    for prune_amount in [0, 0.01, 0.05, 0.1, 0.3, 0.5]:
+        measure_pruned_split_resnet_accuracy(prune_amount)
     # run_test_on_distributed_env(num_workers = 3, test = assert_distributed_resnet_correctness)
-    run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_overheads)
+    # run_test_on_distributed_env(num_workers = 3, test = assert_distributed_resnet_correctness, prune_amount = 0.4)
+    # run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_overheads)
     # run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True)
+    # run_test_on_distributed_env(num_workers = 3, test = measure_distributed_resnet_accuracy_and_latency, use_pretrained_resnet = True, prune_amount = 0.5)
 
     # 실험: 워커 노드의 수를 하나씩 늘려가며 실행 시간이 얼마나 늘어나는지 측정
     # 예측: 총 데이터 전송량이 노드 수에 비례하므로 선형적인 관계를 가질 것임
