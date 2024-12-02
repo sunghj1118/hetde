@@ -19,6 +19,7 @@ COPY rpc_test.py rpc_test.py
 COPY rpc_resnet.py rpc_resnet.py
 COPY mp_resnet.py mp_resnet.py
 COPY cifar_resnet.py cifar_resnet.py
+COPY test_prune_overhead.py test_prune_overhead.py
 
 CMD ["python", "test.py"]
 
